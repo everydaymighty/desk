@@ -1,0 +1,14 @@
+# build output
+black.exe
+black.new.exe
+black
+black.new
+*.o
+
+# large third-party single header (downloaded via VOICE-SETUP.md)
+miniaudio.h
+
+# runtime/local state (regenerated at runtime)
+desk_user.txt
+desk_online.txt
+desk_chat.txt
