@@ -157,32 +157,32 @@ static void PollLobby(void)
     char cmd[1024];
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 \"%s/hello?name=%s\" >NUL 2>&1",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/hello?name=%s\" >NUL 2>&1",
         g_serverURL, g_username);
     system(cmd);
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/online\" 2>NUL",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/online\" 2>NUL",
         ONLINE_FILE, g_serverURL);
     system(cmd);
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/chat\" 2>NUL",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/chat\" 2>NUL",
         CHAT_FILE, g_serverURL);
     system(cmd);
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>NUL",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/friends?name=%s\" 2>NUL",
         FRIENDS_FILE, g_serverURL, g_username);
     system(cmd);
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/leaderboard\" 2>NUL",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/leaderboard\" 2>NUL",
         LEADERBOARD_FILE, g_serverURL);
     system(cmd);
 #else
     snprintf(cmd, sizeof(cmd),
-        "( curl -s -m 4 \"%s/hello?name=%s\" >/dev/null 2>&1; "
-        "  curl -s -m 4 -o \"%s\" \"%s/online\" 2>/dev/null; "
-        "  curl -s -m 4 -o \"%s\" \"%s/chat\" 2>/dev/null; "
-        "  curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>/dev/null; "
-        "  curl -s -m 4 -o \"%s\" \"%s/leaderboard\" 2>/dev/null ) &",
+        "( curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/hello?name=%s\" >/dev/null 2>&1; "
+        "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/online\" 2>/dev/null; "
+        "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/chat\" 2>/dev/null; "
+        "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/friends?name=%s\" 2>/dev/null; "
+        "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/leaderboard\" 2>/dev/null ) &",
         g_serverURL, g_username, ONLINE_FILE, g_serverURL, CHAT_FILE, g_serverURL,
         FRIENDS_FILE, g_serverURL, g_username, LEADERBOARD_FILE, g_serverURL);
     system(cmd);
@@ -224,11 +224,11 @@ static void AddFriend(const char *friendName)
     char cmd[1024];
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 \"%s/addfriend?name=%s&friend=%s\" >NUL 2>&1",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/addfriend?name=%s&friend=%s\" >NUL 2>&1",
         g_serverURL, g_username, friendName);
 #else
     snprintf(cmd, sizeof(cmd),
-        "curl -s -m 4 \"%s/addfriend?name=%s&friend=%s\" >/dev/null 2>&1 &",
+        "curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/addfriend?name=%s&friend=%s\" >/dev/null 2>&1 &",
         g_serverURL, g_username, friendName);
 #endif
     system(cmd);
@@ -248,7 +248,7 @@ static int IsFriend(const char *name)
 static void GameJoin(void)
 {
     char cmd[1024], out[64];
-    snprintf(cmd, sizeof(cmd), "curl -s -m 5 \"%s/join?name=%s\"", g_serverURL, g_username);
+    snprintf(cmd, sizeof(cmd), "curl -s -m 5 -H \"ngrok-skip-browser-warning: 1\" \"%s/join?name=%s\"", g_serverURL, g_username);
     if (RunCapture(cmd, out, sizeof(out))) {
         if (strncmp(out, "PLAYER 0", 8) == 0) g_myRole = 0;
         else if (strncmp(out, "PLAYER 1", 8) == 0) g_myRole = 1;
@@ -261,10 +261,10 @@ static void GamePoll(void)
     char cmd[1024];
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/gamestate\" 2>NUL", GAMESTATE_FILE, g_serverURL);
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/gamestate\" 2>NUL", GAMESTATE_FILE, g_serverURL);
 #else
     snprintf(cmd, sizeof(cmd),
-        "curl -s -m 4 -o \"%s\" \"%s/gamestate\" 2>/dev/null &", GAMESTATE_FILE, g_serverURL);
+        "curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"-o \"%s\" \"%s/gamestate\" 2>/dev/null &", GAMESTATE_FILE, g_serverURL);
 #endif
     system(cmd);
     FILE *fp = fopen(GAMESTATE_FILE, "r");
@@ -311,11 +311,11 @@ static void SendChat(const char *msg)
     char cmd[1024];
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
-        "cmd /c start \"\" /b curl -s -m 4 \"%s/say?name=%s&msg=%s\" >NUL 2>&1",
+        "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/say?name=%s&msg=%s\" >NUL 2>&1",
         g_serverURL, g_username, enc);
 #else
     snprintf(cmd, sizeof(cmd),
-        "curl -s -m 4 \"%s/say?name=%s&msg=%s\" >/dev/null 2>&1 &",
+        "curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/say?name=%s&msg=%s\" >/dev/null 2>&1 &",
         g_serverURL, g_username, enc);
 #endif
     system(cmd);
@@ -403,17 +403,18 @@ static int AuthRequest(const char *action, const char *name, const char *pw,
                        char *errOut, size_t errSize)
 {
     char cmd[1024], out[1024];
+    // The ngrok-skip-browser-warning header bypasses ngrok's free interstitial
+    // HTML page (which otherwise breaks the JSON response). Harmless off ngrok.
 #if defined(_WIN32)
-    // Windows cmd: inline JSON, escaping the inner double-quotes as \" so they
-    // survive cmd.exe. This is the standard Windows curl JSON pattern.
     snprintf(cmd, sizeof(cmd),
         "curl -s -m 8 -X POST -H \"Content-Type: application/json\" "
+        "-H \"ngrok-skip-browser-warning: 1\" "
         "-d \"{\\\"name\\\":\\\"%s\\\",\\\"pw\\\":\\\"%s\\\"}\" \"%s/%s\"",
         name, pw, g_authURL, action);
 #else
-    // Unix shell: single-quote the JSON so the inner double-quotes are literal.
     snprintf(cmd, sizeof(cmd),
         "curl -s -m 8 -X POST -H 'Content-Type: application/json' "
+        "-H 'ngrok-skip-browser-warning: 1' "
         "-d '{\"name\":\"%s\",\"pw\":\"%s\"}' '%s/%s'",
         name, pw, g_authURL, action);
 #endif
@@ -1283,7 +1284,7 @@ int main(void)
             static double scoreLock = 0;
             if (haveOpp && opp.hp <= 0 && fpHP > 0 && GetTime() > scoreLock && !win[0]) {
                 char cmd[512], out[64];
-                snprintf(cmd,sizeof(cmd),"curl -s -m 4 \"%s/score?name=%s\"", g_serverURL, g_username);
+                snprintf(cmd,sizeof(cmd),"curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/score?name=%s\"", g_serverURL, g_username);
                 RunCapture(cmd,out,sizeof(out));
                 scoreLock = GetTime() + 3.0;     // avoid double-report
                 fpHP = 100;                      // reset my health for next round
@@ -1379,7 +1380,7 @@ int main(void)
                     if (Button(rb, "Back to lobby", 16, (Color){40,42,52,255},(Color){54,57,70,255},RAYWHITE,m)) {
                         // reset match on server, return
                         char cmd[256], out[32];
-                        snprintf(cmd,sizeof(cmd),"curl -s -m 4 \"%s/resetmatch\"", g_serverURL);
+                        snprintf(cmd,sizeof(cmd),"curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\"\"%s/resetmatch\"", g_serverURL);
                         RunCapture(cmd,out,sizeof(out));
                         inMatchFPS=false; screen=SCREEN_LOBBY;
                     }
