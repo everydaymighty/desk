@@ -21,6 +21,7 @@
 // Voice (mic/speaker/UDP) lives in voice.c behind this small API, so its
 // windows.h include never clashes with raylib.
 #include "voice.h"
+#include "game.h"
 
 // ---- Crisp anti-aliased text (replaces raylib's blocky default font) ----
 static Font g_font;
@@ -117,7 +118,9 @@ static char g_online[2048]   = "";   // raw newline-separated names from server
 static char g_chat[4096]     = "";   // raw newline-separated chat lines from server
 static char g_friends[2048]  = "";   // raw newline-separated friend names
 #define GAMESTATE_FILE "desk_game.txt"
+#define LEADERBOARD_FILE "desk_lb.txt"
 static char g_gamestate[512] = "";   // raw JSON match state from server
+static char g_leaderboard[1024] = "";// raw "name W-L" lines
 static int  g_myRole = -1;           // -1 unknown, 0/1 = player slot, 2 = spectator
 
 // Forward declaration (defined later, used by GameJoin above its definition).
@@ -169,14 +172,19 @@ static void PollLobby(void)
         "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>NUL",
         FRIENDS_FILE, g_serverURL, g_username);
     system(cmd);
+    snprintf(cmd, sizeof(cmd),
+        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/leaderboard\" 2>NUL",
+        LEADERBOARD_FILE, g_serverURL);
+    system(cmd);
 #else
     snprintf(cmd, sizeof(cmd),
         "( curl -s -m 4 \"%s/hello?name=%s\" >/dev/null 2>&1; "
         "  curl -s -m 4 -o \"%s\" \"%s/online\" 2>/dev/null; "
         "  curl -s -m 4 -o \"%s\" \"%s/chat\" 2>/dev/null; "
-        "  curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>/dev/null ) &",
+        "  curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>/dev/null; "
+        "  curl -s -m 4 -o \"%s\" \"%s/leaderboard\" 2>/dev/null ) &",
         g_serverURL, g_username, ONLINE_FILE, g_serverURL, CHAT_FILE, g_serverURL,
-        FRIENDS_FILE, g_serverURL, g_username);
+        FRIENDS_FILE, g_serverURL, g_username, LEADERBOARD_FILE, g_serverURL);
     system(cmd);
 #endif
 }
@@ -199,6 +207,12 @@ static void ReadOnlineFile(void)
     if (fp) {
         size_t n = fread(g_friends, 1, sizeof(g_friends) - 1, fp);
         g_friends[n] = '\0';
+        fclose(fp);
+    }
+    fp = fopen(LEADERBOARD_FILE, "r");
+    if (fp) {
+        size_t n = fread(g_leaderboard, 1, sizeof(g_leaderboard) - 1, fp);
+        g_leaderboard[n] = '\0';
         fclose(fp);
     }
 }
@@ -506,6 +520,14 @@ int main(void)
     double nextPoll = 0.0;   // poll the lobby server on a timer
 
     bool voiceOK = voice_init(g_username);   // mic + speaker + UDP socket (tagged with our name)
+    game_init(g_username);                    // 1v1 arena networking
+
+    // First-person player state (arena)
+    Vector3 fpPos = { -3, 1.6f, 0 };          // eye position
+    float fpYaw = 0, fpPitch = 0;             // look angles (radians)
+    int fpHP = 100, fpScore = 0;
+    bool inMatchFPS = false;                   // are we an active fighter (vs spectator)
+    double nextNetSend = 0, fireCooldown = 0;
 
     const char *label = "Folder";
     Rectangle icon = { 80, 80, 90, 70 };
@@ -552,6 +574,7 @@ int main(void)
 
         // Voice: hold V to talk; always drain incoming audio.
         if (voiceOK) { voice_set_master(masterVol); voice_set_talking(!micMuted && IsKeyDown(KEY_V)); voice_poll(); }
+        game_poll();
 
         // Heartbeat + refresh online list every 2 seconds once we have a name.
         if (g_username[0] && GetTime() >= nextPoll) {
@@ -947,6 +970,25 @@ int main(void)
                         fl = strtok(NULL, "\n");
                     }
                     if (fsh == 0) Txt("(none yet)", px+18, fy, 13, GRAY);
+
+                    // ---- Leaderboard, below Friends ----
+                    int lpy = fpy + fph + 12;
+                    int lc = 0; for (const char *p=g_leaderboard; *p; p++) if (*p=='\n') lc++;
+                    int lph = 44 + (lc>0?lc:1)*20;
+                    DrawRectangleRounded((Rectangle){px,lpy,pw,lph}, 0.08f, 6, (Color){245,245,245,235});
+                    DrawRectangleRoundedLines((Rectangle){px,lpy,pw,lph}, 0.08f, 6, (Color){180,180,180,255});
+                    Txt("Leaderboard (W-L)", px+14, lpy+10, 16, (Color){40,40,40,255});
+                    char lbuf[1024]; strncpy(lbuf,g_leaderboard,sizeof(lbuf)-1); lbuf[sizeof(lbuf)-1]='\0';
+                    int ly = lpy+36, lsh=0, rank=1;
+                    char *lln = strtok(lbuf,"\n");
+                    while (lln) {
+                        if (lln[0]) {
+                            Txt(TextFormat("%d. %s", rank, lln), px+18, ly, 14, (Color){60,60,70,255});
+                            ly += 20; lsh++; rank++;
+                        }
+                        lln = strtok(NULL,"\n");
+                    }
+                    if (lsh==0) Txt("(no games yet)", px+18, ly, 13, GRAY);
                 }
                 Txt(TextFormat("server: %s", g_serverURL), 20, H-20, 14, GRAY);
 
@@ -1088,68 +1130,193 @@ int main(void)
                 }
             EndDrawing();
         }
-        else // SCREEN_GAME (1v1 arena — matchmaking shell, no shooting yet)
+        else // SCREEN_GAME — first-person 1v1 arena
         {
-            // Refresh match state on the regular poll cadence.
-            // (g_gamestate is fetched in GamePoll, called from the timer below.)
-            if (IsKeyPressed(KEY_ESCAPE)) screen = SCREEN_LOBBY;
+            float dt = GetFrameTime();
+            int spectator = (g_myRole == 2);
 
+            // Match info from the lobby server (scores/round/winner).
             char p0[32], p1[32], win[32];
             GsStr("p0", p0, sizeof(p0)); GsStr("p1", p1, sizeof(p1)); GsStr("winner", win, sizeof(win));
             int s0 = GsInt("s0"), s1 = GsInt("s1"), round = GsInt("round");
             int filled = (p0[0]?1:0) + (p1[0]?1:0);
 
-            // Two player positions in a white box arena (placeholder cubes).
-            Camera3D gcam = { 0 };
-            gcam.position=(Vector3){0,7,10}; gcam.target=(Vector3){0,1,0};
-            gcam.up=(Vector3){0,1,0}; gcam.fovy=50; gcam.projection=CAMERA_PERSPECTIVE;
+            // ---- Arena geometry: floor 16x16, four cover boxes ----
+            #define NCOVER 4
+            Vector3 coverPos[NCOVER]  = { {-2.5f,1,-2.5f}, {2.5f,1,2.5f}, {-2.5f,1,2.5f}, {2.5f,1,-2.5f} };
+            Vector3 coverSize = { 2.0f, 2.0f, 2.0f };
 
+            // Spawn point per slot.
+            if (!inMatchFPS && !spectator) {
+                fpPos = (g_myRole==1) ? (Vector3){3,1.6f,5} : (Vector3){-3,1.6f,-5};
+                fpYaw = (g_myRole==1) ? 3.14159f : 0.0f;
+                fpPitch = 0; fpHP = 100; inMatchFPS = true;
+            }
+
+            // ---- Mouse look (only when not in menus) ----
+            if (!spectator && !win[0]) {
+                Vector2 md = GetMouseDelta();
+                fpYaw   += md.x * 0.003f;
+                fpPitch -= md.y * 0.003f;
+                if (fpPitch >  1.5f) fpPitch =  1.5f;
+                if (fpPitch < -1.5f) fpPitch = -1.5f;
+                DisableCursor();
+            } else {
+                EnableCursor();
+            }
+
+            // ---- WASD movement with simple cover collision ----
+            if (!spectator && !win[0]) {
+                float spd = 5.0f * dt;
+                Vector3 fwd = { cosf(fpYaw), 0, sinf(fpYaw) };
+                Vector3 rgt = { -sinf(fpYaw), 0, cosf(fpYaw) };
+                Vector3 np = fpPos;
+                if (IsKeyDown(KEY_W)) { np.x += fwd.x*spd; np.z += fwd.z*spd; }
+                if (IsKeyDown(KEY_S)) { np.x -= fwd.x*spd; np.z -= fwd.z*spd; }
+                if (IsKeyDown(KEY_D)) { np.x += rgt.x*spd; np.z += rgt.z*spd; }
+                if (IsKeyDown(KEY_A)) { np.x -= rgt.x*spd; np.z -= rgt.z*spd; }
+                // keep inside walls
+                if (np.x >  7.3f) np.x =  7.3f; if (np.x < -7.3f) np.x = -7.3f;
+                if (np.z >  7.3f) np.z =  7.3f; if (np.z < -7.3f) np.z = -7.3f;
+                // block cover boxes (treat me as a point at chest height)
+                int blocked = 0;
+                for (int i=0;i<NCOVER;i++) {
+                    float hx=coverSize.x/2+0.4f, hz=coverSize.z/2+0.4f;
+                    if (np.x > coverPos[i].x-hx && np.x < coverPos[i].x+hx &&
+                        np.z > coverPos[i].z-hz && np.z < coverPos[i].z+hz) { blocked=1; break; }
+                }
+                if (!blocked) { fpPos.x = np.x; fpPos.z = np.z; }
+            }
+
+            // ---- Build look direction + FPS camera ----
+            Vector3 dir = { cosf(fpPitch)*cosf(fpYaw), sinf(fpPitch), cosf(fpPitch)*sinf(fpYaw) };
+            Camera3D gcam = { 0 };
+            gcam.position = fpPos;
+            gcam.target   = (Vector3){ fpPos.x+dir.x, fpPos.y+dir.y, fpPos.z+dir.z };
+            gcam.up = (Vector3){0,1,0}; gcam.fovy = 70; gcam.projection = CAMERA_PERSPECTIVE;
+
+            // Opponent state.
+            RemotePlayer opp; int haveOpp = game_get_opponent(&opp);
+
+            // ---- Shooting: raycast from camera toward opponent ----
+            if (!spectator && !win[0] && fireCooldown <= 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                fireCooldown = 0.4f;
+                if (haveOpp && opp.hp > 0) {
+                    // vector to opponent center (chest)
+                    Vector3 oc = { opp.x, opp.y, opp.z };
+                    Vector3 to = { oc.x-fpPos.x, oc.y-fpPos.y, oc.z-fpPos.z };
+                    float len = sqrtf(to.x*to.x+to.y*to.y+to.z*to.z);
+                    if (len > 0.001f) {
+                        Vector3 tn = { to.x/len, to.y/len, to.z/len };
+                        float dot = tn.x*dir.x + tn.y*dir.y + tn.z*dir.z; // 1 = dead on
+                        // aim tolerance tightens with distance; ~ hit if crosshair near them
+                        if (dot > 0.985f) game_send_hit(opp.name, 34);   // ~3 hits to kill
+                    }
+                }
+            }
+            if (fireCooldown > 0) fireCooldown -= dt;
+
+            // ---- Take incoming damage ----
+            int dmg = game_take_damage();
+            if (dmg > 0 && !win[0]) {
+                fpHP -= dmg;
+                if (fpHP <= 0) {
+                    fpHP = 0;
+                    // I died -> opponent won this round. Report THEIR score.
+                    // (each client reports its own round losses by letting the killer score:
+                    //  we tell the server the opponent scored by calling /score as them is not
+                    //  possible, so instead the WINNER reports when they see opp hp hit 0.)
+                }
+            }
+            // If I see the opponent at 0 hp, I (the winner) report the round.
+            static double scoreLock = 0;
+            if (haveOpp && opp.hp <= 0 && fpHP > 0 && GetTime() > scoreLock && !win[0]) {
+                char cmd[512], out[64];
+                snprintf(cmd,sizeof(cmd),"curl -s -m 4 \"%s/score?name=%s\"", g_serverURL, g_username);
+                RunCapture(cmd,out,sizeof(out));
+                scoreLock = GetTime() + 3.0;     // avoid double-report
+                fpHP = 100;                      // reset my health for next round
+                inMatchFPS = false;              // respawn next frame
+            }
+            // If I died, reset for next round after a moment.
+            if (fpHP <= 0 && GetTime() > scoreLock) { scoreLock = GetTime()+3.0; inMatchFPS=false; }
+
+            // ---- Send my state ~20x/sec ----
+            if (!spectator && GetTime() >= nextNetSend) {
+                game_send_state(fpPos.x, fpPos.y, fpPos.z, fpYaw, fpPitch, fpHP, fpScore);
+                nextNetSend = GetTime() + 0.05;
+            }
+
+            if (IsKeyPressed(KEY_ESCAPE)) { EnableCursor(); inMatchFPS=false; screen = SCREEN_LOBBY; }
+
+            // ---- DRAW ----
             BeginDrawing();
-                ClearBackground(RAYWHITE);
+                ClearBackground((Color){235,236,240,255});
                 BeginMode3D(gcam);
-                    // white box room: floor + faint walls
-                    DrawPlane((Vector3){0,0,0},(Vector2){16,16},(Color){240,240,242,255});
-                    DrawCubeWires((Vector3){0,2.5f,0},16,5,16,(Color){210,210,216,255});
-                    // player 1 (left), player 2 (right)
-                    if (p0[0]) { DrawCube((Vector3){-3,1,0},1.2f,2,1.2f,(Color){200,60,60,255});
-                                 DrawCubeWires((Vector3){-3,1,0},1.2f,2,1.2f,MAROON); }
-                    if (p1[0]) { DrawCube((Vector3){ 3,1,0},1.2f,2,1.2f,(Color){60,90,200,255});
-                                 DrawCubeWires((Vector3){ 3,1,0},1.2f,2,1.2f,(Color){30,50,140,255}); }
+                    DrawPlane((Vector3){0,0,0},(Vector2){16,16},(Color){248,248,250,255});
+                    DrawCubeWires((Vector3){0,2.5f,0},16,5,16,(Color){205,207,214,255});
+                    // cover boxes
+                    for (int i=0;i<NCOVER;i++){
+                        DrawCubeV(coverPos[i], coverSize, (Color){200,202,210,255});
+                        DrawCubeWiresV(coverPos[i], coverSize, (Color){150,152,162,255});
+                    }
+                    // opponent as a body cube + head
+                    if (haveOpp && opp.hp > 0) {
+                        Color oc = (Color){200,70,70,255};
+                        DrawCube((Vector3){opp.x,opp.y,opp.z}, 0.9f,1.6f,0.9f, oc);
+                        DrawCubeWires((Vector3){opp.x,opp.y,opp.z}, 0.9f,1.6f,0.9f, MAROON);
+                        DrawSphere((Vector3){opp.x,opp.y+1.0f,opp.z}, 0.35f, oc);
+                    }
                 EndMode3D();
 
-                // Top bar: slot counter + scoreboard
-                char cnt[16]; snprintf(cnt,sizeof(cnt),"%d/2", filled);
-                Txt(cnt, W/2 - TxtW(cnt,28)/2, 16, 28, (Color){40,40,50,255});
-
-                // Scoreboard (best of 3)
-                Txt(p0[0]?p0:"(waiting)", 40, 60, 20, (Color){200,60,60,255});
-                Txt(TextFormat("%d", s0), 40, 88, 26, (Color){40,40,50,255});
-                Txt(p1[0]?p1:"(waiting)", W-40-TxtW(p1[0]?p1:"(waiting)",20), 60, 20, (Color){60,90,200,255});
-                Txt(TextFormat("%d", s1), W-60, 88, 26, (Color){40,40,50,255});
-                Txt(TextFormat("Round %d  ·  Best of 3", round), W/2 - TxtW("Round 1  ·  Best of 3",16)/2, 52, 16, (Color){110,110,120,255});
-
-                // Role / status line
-                const char *roleTxt = (g_myRole==2) ? "Spectating (match full)" :
-                                      (g_myRole==0||g_myRole==1) ? "You are in the match" : "Joining...";
-                Txt(roleTxt, W/2 - TxtW(roleTxt,16)/2, H-90, 16,
-                    g_myRole==2 ? (Color){150,120,60,255} : (Color){70,130,90,255});
-
-                if (win[0]) {
-                    Txt(TextFormat("%s wins the match!", win),
-                        W/2 - TxtW(TextFormat("%s wins the match!",win),26)/2, H/2-13, 26, (Color){40,40,50,255});
+                // crosshair
+                if (!spectator && !win[0]) {
+                    DrawLine(W/2-10, H/2, W/2+10, H/2, (Color){40,40,50,200});
+                    DrawLine(W/2, H/2-10, W/2, H/2+10, (Color){40,40,50,200});
                 }
 
-                // Back button
-                Rectangle gback = { 20, H-50, 110, 34 };
-                if (Button(gback, "< Leave", 16, (Color){235,235,238,255}, (Color){222,222,228,255}, (Color){50,52,62,255}, m))
-                    screen = SCREEN_LOBBY;
+                // health bar
+                if (!spectator) {
+                    DrawRectangle(24, H-44, 220, 22, (Color){210,210,216,255});
+                    DrawRectangle(24, H-44, (int)(220*(fpHP/100.0f)), 22, (Color){70,160,90,255});
+                    Txt(TextFormat("HP %d", fpHP), 30, H-42, 16, (Color){30,30,40,255});
+                }
 
-                Txt("(movement & shooting coming next)", W/2 - TxtW("(movement & shooting coming next)",13)/2, H-24, 13, (Color){150,150,160,255});
+                // scoreboard top
+                char cnt[16]; snprintf(cnt,sizeof(cnt),"%d/2", filled);
+                Txt(cnt, W/2 - TxtW(cnt,26)/2, 12, 26, (Color){40,40,50,255});
+                Txt(p0[0]?p0:"(waiting)", 24, 48, 18, (Color){200,60,60,255});
+                Txt(TextFormat("%d", s0), 24, 72, 24, (Color){40,40,50,255});
+                Txt(p1[0]?p1:"(waiting)", W-24-TxtW(p1[0]?p1:"(waiting)",18), 48, 18, (Color){60,90,200,255});
+                Txt(TextFormat("%d", s1), W-44, 72, 24, (Color){40,40,50,255});
+                Txt(TextFormat("Round %d  -  Best of 3", round), W/2 - TxtW("Round 1  -  Best of 3",15)/2, 44, 15, (Color){110,110,120,255});
+
+                if (spectator)
+                    Txt("Spectating (match full)", W/2 - TxtW("Spectating (match full)",18)/2, H-70, 18, (Color){150,120,60,255});
+
+                if (win[0]) {
+                    EnableCursor();
+                    const char *wt = TextFormat("%s wins the match!", win);
+                    DrawRectangle(0,H/2-50,W,100,(Color){0,0,0,120});
+                    Txt(wt, W/2 - TxtW(wt,30)/2, H/2-30, 30, RAYWHITE);
+                    Rectangle rb = { W*0.5f-80, H/2+12, 160, 34 };
+                    if (Button(rb, "Back to lobby", 16, (Color){40,42,52,255},(Color){54,57,70,255},RAYWHITE,m)) {
+                        // reset match on server, return
+                        char cmd[256], out[32];
+                        snprintf(cmd,sizeof(cmd),"curl -s -m 4 \"%s/resetmatch\"", g_serverURL);
+                        RunCapture(cmd,out,sizeof(out));
+                        inMatchFPS=false; screen=SCREEN_LOBBY;
+                    }
+                }
+
+                Txt("WASD move  -  Mouse look  -  Click shoot  -  Esc leave",
+                    24, H-72, 13, (Color){120,120,130,255});
             EndDrawing();
         }
     }
 
     voice_shutdown();
+    game_shutdown();
     if (g_fontOK) UnloadFont(g_font);
     CloseWindow();
     return 0;

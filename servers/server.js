@@ -22,12 +22,25 @@ const TIMEOUT_MS = 6000;       // drop users we haven't heard from in this long
 
 const seen = new Map();        // name -> last heartbeat timestamp (ms)
 const chat = [];               // recent chat lines: "name: message"
+const gstates = {};            // name -> { st, last }  live game state (HTTP relay)
+const ghits = {};              // name -> pending damage total
 
 // Friends: { username: [friendName, ...] }, persisted to friends.json
 const FRIENDS_FILE = "friends.json";
 let friends = {};
 try { friends = JSON.parse(fs.readFileSync(FRIENDS_FILE, "utf8")); } catch (e) { friends = {}; }
 function saveFriends() { try { fs.writeFileSync(FRIENDS_FILE, JSON.stringify(friends)); } catch (e) {} }
+
+// Leaderboard: { name: { w, l } }, persisted to leaderboard.json
+const LB_FILE = "leaderboard.json";
+let lb = {};
+try { lb = JSON.parse(fs.readFileSync(LB_FILE, "utf8")); } catch (e) { lb = {}; }
+function saveLb() { try { fs.writeFileSync(LB_FILE, JSON.stringify(lb)); } catch (e) {} }
+function recordResult(winner, loser) {
+  if (winner) { if (!lb[winner]) lb[winner] = { w:0, l:0 }; lb[winner].w++; }
+  if (loser)  { if (!lb[loser])  lb[loser]  = { w:0, l:0 }; lb[loser].l++; }
+  saveLb();
+}
 
 // ---- 1v1 match state (best of 3) ----
 // Two player slots. A player claims a slot via /join; others spectate.
@@ -144,9 +157,24 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     if (slot < 0 || match.winner) { res.end("ERR\n"); return; }
     match.scores[slot]++;
-    if (match.scores[slot] >= 2) match.winner = name;   // best of 3
-    else match.round++;
+    if (match.scores[slot] >= 2) {
+      match.winner = name;                                 // best of 3
+      const otherSlot = slot === 0 ? 1 : 0;
+      const loser = match.players[otherSlot] ? match.players[otherSlot].name : null;
+      recordResult(name, loser);                           // update leaderboard
+    } else match.round++;
     res.end("OK\n");
+    return;
+  }
+
+  // Leaderboard: sorted by wins, "name W-L" per line
+  if (path === "/leaderboard") {
+    const rows = Object.entries(lb)
+      .sort((a,b) => (b[1].w - a[1].w) || (a[1].l - b[1].l))
+      .slice(0, 10)
+      .map(([n,r]) => `${n} ${r.w}-${r.l}`);
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(rows.join("\n") + "\n");
     return;
   }
 
@@ -155,6 +183,42 @@ const server = http.createServer((req, res) => {
     match.scores = [0,0]; match.round = 1; match.winner = null;
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("OK\n");
+    return;
+  }
+
+  // ---- Game state relay over HTTP (works through ngrok; no UDP needed) ----
+  // Each player POSTs/marks their state via /gset; others read all via /gget.
+  // State string per player: "x|y|z|yaw|pitch|hp|score". Hits via /ghit.
+  if (path === "/gset") {
+    const name = (parsed.query.name || "").toString().slice(0,24).trim();
+    const st   = (parsed.query.st   || "").toString().slice(0,120);
+    if (name) { gstates[name] = { st, last: Date.now() }; }
+    res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n");
+    return;
+  }
+  if (path === "/gget") {
+    const now = Date.now();
+    const lines = [];
+    for (const [n,v] of Object.entries(gstates)) {
+      if (now - v.last > 5000) { delete gstates[n]; continue; }
+      lines.push(n + "|" + v.st);
+    }
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(lines.join("\n") + "\n");
+    return;
+  }
+  if (path === "/ghit") {
+    const target = (parsed.query.target || "").toString().slice(0,24).trim();
+    const dmg    = parseInt(parsed.query.dmg || "0", 10) || 0;
+    if (target) { ghits[target] = (ghits[target] || 0) + dmg; }
+    res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n");
+    return;
+  }
+  if (path === "/gdmg") {
+    const name = (parsed.query.name || "").toString().slice(0,24).trim();
+    const d = ghits[name] || 0; ghits[name] = 0;
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(d + "\n");
     return;
   }
 
