@@ -15,8 +15,7 @@ const server = dgram.createSocket("udp4");
 const PORT = 8081;
 const TIMEOUT_MS = 8000;
 
-// key "ip:port" -> { addr, port, last }
-const peers = new Map();
+const peers = new Map(); // key "ip:port" -> { addr, port, last }
 
 server.on("message", (msg, rinfo) => {
   const key = rinfo.address + ":" + rinfo.port;

@@ -11,21 +11,89 @@
 // connection come next.
 
 #include "raylib.h"
+#include "rlgl.h"      // rlPushMatrix / rlRotatef for the 3D background
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 
 // Voice (mic/speaker/UDP) lives in voice.c behind this small API, so its
 // windows.h include never clashes with raylib.
 #include "voice.h"
+
+// ---- Crisp anti-aliased text (replaces raylib's blocky default font) ----
+static Font g_font;
+static bool g_fontOK = false;
+
+static void LoadUIFont(void) {
+    const char *candidates[] = {
+        "C:/Windows/Fonts/segoeui.ttf",        // Windows
+        "C:/Windows/Fonts/arial.ttf",
+        "/System/Library/Fonts/SFNS.ttf",       // macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        if (FileExists(candidates[i])) {
+            // Load at high resolution so it stays sharp at any size.
+            g_font = LoadFontEx(candidates[i], 64, NULL, 0);
+            if (g_font.texture.id != 0) {
+                SetTextureFilter(g_font.texture, TEXTURE_FILTER_BILINEAR);
+                g_fontOK = true;
+                return;
+            }
+        }
+    }
+}
+
+// Drop-in replacements with the same argument order as DrawText/MeasureText.
+static void Txt(const char *t, int x, int y, int size, Color c) {
+    if (g_fontOK) DrawTextEx(g_font, t, (Vector2){(float)x,(float)y}, (float)size, 1.0f, c);
+    else          DrawText(t, x, y, size, c);
+}
+static int TxtW(const char *t, int size) {
+    if (g_fontOK) return (int)MeasureTextEx(g_font, t, (float)size, 1.0f).x;
+    return MeasureText(t, size);
+}
+
+// A flat, minimal, hover-aware button. No drop shadow, slight rounding, a thin
+// border that brightens on hover — a more restrained, mature look.
+static bool Button(Rectangle r, const char *label, int fontSize,
+                   Color base, Color hover, Color textCol, Vector2 mouse) {
+    bool over = CheckCollisionPointRec(mouse, r);
+    Color c = over ? hover : base;
+    DrawRectangleRounded(r, 0.16f, 6, c);
+    DrawRectangleRoundedLines(r, 0.16f, 6, over ? (Color){120,125,140,200} : (Color){70,72,84,160});
+    int tw = TxtW(label, fontSize);
+    Txt(label, (int)(r.x + r.width/2 - tw/2), (int)(r.y + r.height/2 - fontSize/2), fontSize, textCol);
+    return over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+// Horizontal slider 0..maxVal. Drag or click the track to set. Returns value.
+static int Slider(Rectangle r, int value, int maxVal, Vector2 mouse) {
+    DrawRectangleRounded((Rectangle){r.x, r.y + r.height/2 - 3, r.width, 6}, 1.0f, 4, (Color){55,57,68,255});
+    float frac = (float)value / (float)maxVal;
+    float kx = r.x + frac * r.width;
+    // filled portion
+    DrawRectangleRounded((Rectangle){r.x, r.y + r.height/2 - 3, kx - r.x, 6}, 1.0f, 4, (Color){90,120,170,255});
+    DrawCircle((int)kx, (int)(r.y + r.height/2), 8, (Color){150,170,210,255});
+    if (CheckCollisionPointRec(mouse, (Rectangle){r.x-8, r.y-6, r.width+16, r.height+12})
+        && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        float f = (mouse.x - r.x) / r.width;
+        if (f < 0) f = 0; if (f > 1) f = 1;
+        value = (int)(f * maxVal + 0.5f);
+    }
+    return value;
+}
 
 // ---- Bump this every time you publish a new GitHub release ----
 #define APP_VERSION "v0.1.0"
 #define GH_OWNER    "everydaymighty"
 #define GH_REPO     "desk"
 
-typedef enum { SCREEN_USERNAME, SCREEN_DESKTOP, SCREEN_LOBBY } Screen;
+typedef enum { SCREEN_USERNAME, SCREEN_DESKTOP, SCREEN_LOBBY, SCREEN_GAME } Screen;
 
 static char g_updateMsg[256] = "";
 
@@ -38,11 +106,34 @@ static char g_username[32] = "";
 // for local testing, or your ngrok https URL for other computers). If the file
 // is missing we default to localhost.
 #define SERVER_FILE "desk_server.txt"
+#define AUTH_FILE   "desk_auth.txt"     // auth server URL (default localhost:8090)
 #define ONLINE_FILE "desk_online.txt"
 #define CHAT_FILE   "desk_chat.txt"
+#define FRIENDS_FILE "desk_friends.txt"
 static char g_serverURL[256] = "http://localhost:8080";
+static char g_authURL[256]   = "http://localhost:8090";
+static char g_token[512]     = "";   // session token from the auth server
 static char g_online[2048]   = "";   // raw newline-separated names from server
 static char g_chat[4096]     = "";   // raw newline-separated chat lines from server
+static char g_friends[2048]  = "";   // raw newline-separated friend names
+#define GAMESTATE_FILE "desk_game.txt"
+static char g_gamestate[512] = "";   // raw JSON match state from server
+static int  g_myRole = -1;           // -1 unknown, 0/1 = player slot, 2 = spectator
+
+// Forward declaration (defined later, used by GameJoin above its definition).
+static int RunCapture(const char *cmd, char *out, size_t outSize);
+
+static void LoadAuthURL(void)
+{
+    FILE *fp = fopen(AUTH_FILE, "r");
+    if (!fp) return;
+    if (fgets(g_authURL, sizeof(g_authURL), fp)) {
+        size_t n = strlen(g_authURL);
+        while (n > 0 && (g_authURL[n-1]=='\n'||g_authURL[n-1]=='\r'||g_authURL[n-1]==' '||g_authURL[n-1]=='/'))
+            g_authURL[--n] = '\0';
+    }
+    fclose(fp);
+}
 
 static void LoadServerURL(void)
 {
@@ -74,12 +165,18 @@ static void PollLobby(void)
         "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/chat\" 2>NUL",
         CHAT_FILE, g_serverURL);
     system(cmd);
+    snprintf(cmd, sizeof(cmd),
+        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>NUL",
+        FRIENDS_FILE, g_serverURL, g_username);
+    system(cmd);
 #else
     snprintf(cmd, sizeof(cmd),
         "( curl -s -m 4 \"%s/hello?name=%s\" >/dev/null 2>&1; "
         "  curl -s -m 4 -o \"%s\" \"%s/online\" 2>/dev/null; "
-        "  curl -s -m 4 -o \"%s\" \"%s/chat\" 2>/dev/null ) &",
-        g_serverURL, g_username, ONLINE_FILE, g_serverURL, CHAT_FILE, g_serverURL);
+        "  curl -s -m 4 -o \"%s\" \"%s/chat\" 2>/dev/null; "
+        "  curl -s -m 4 -o \"%s\" \"%s/friends?name=%s\" 2>/dev/null ) &",
+        g_serverURL, g_username, ONLINE_FILE, g_serverURL, CHAT_FILE, g_serverURL,
+        FRIENDS_FILE, g_serverURL, g_username);
     system(cmd);
 #endif
 }
@@ -98,6 +195,82 @@ static void ReadOnlineFile(void)
         g_chat[n] = '\0';
         fclose(fp);
     }
+    fp = fopen(FRIENDS_FILE, "r");
+    if (fp) {
+        size_t n = fread(g_friends, 1, sizeof(g_friends) - 1, fp);
+        g_friends[n] = '\0';
+        fclose(fp);
+    }
+}
+
+// Tell the server to add a friend (detached, non-blocking).
+static void AddFriend(const char *friendName)
+{
+    if (!friendName[0]) return;
+    char cmd[1024];
+#if defined(_WIN32)
+    snprintf(cmd, sizeof(cmd),
+        "cmd /c start \"\" /b curl -s -m 4 \"%s/addfriend?name=%s&friend=%s\" >NUL 2>&1",
+        g_serverURL, g_username, friendName);
+#else
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -m 4 \"%s/addfriend?name=%s&friend=%s\" >/dev/null 2>&1 &",
+        g_serverURL, g_username, friendName);
+#endif
+    system(cmd);
+}
+
+// Is this name already in our friends list?
+static int IsFriend(const char *name)
+{
+    char buf[2048]; strncpy(buf, g_friends, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+    char *ln = strtok(buf, "\n");
+    while (ln) { if (strcmp(ln, name) == 0) return 1; ln = strtok(NULL, "\n"); }
+    return 0;
+}
+
+// --- Game matchmaking helpers ---
+// Claim a slot (or spectator). Reads back "PLAYER 0/1" or "SPECTATOR".
+static void GameJoin(void)
+{
+    char cmd[1024], out[64];
+    snprintf(cmd, sizeof(cmd), "curl -s -m 5 \"%s/join?name=%s\"", g_serverURL, g_username);
+    if (RunCapture(cmd, out, sizeof(out))) {
+        if (strncmp(out, "PLAYER 0", 8) == 0) g_myRole = 0;
+        else if (strncmp(out, "PLAYER 1", 8) == 0) g_myRole = 1;
+        else if (strncmp(out, "SPECTATOR", 9) == 0) g_myRole = 2;
+    }
+}
+// Fetch current match state JSON into g_gamestate (detached, non-blocking).
+static void GamePoll(void)
+{
+    char cmd[1024];
+#if defined(_WIN32)
+    snprintf(cmd, sizeof(cmd),
+        "cmd /c start \"\" /b curl -s -m 4 -o \"%s\" \"%s/gamestate\" 2>NUL", GAMESTATE_FILE, g_serverURL);
+#else
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -m 4 -o \"%s\" \"%s/gamestate\" 2>/dev/null &", GAMESTATE_FILE, g_serverURL);
+#endif
+    system(cmd);
+    FILE *fp = fopen(GAMESTATE_FILE, "r");
+    if (fp) { size_t n = fread(g_gamestate,1,sizeof(g_gamestate)-1,fp); g_gamestate[n]='\0'; fclose(fp); }
+}
+// Tiny JSON int extractor for the gamestate.
+static int GsInt(const char *key) {
+    char pat[32]; snprintf(pat,sizeof(pat),"\"%s\":",key);
+    const char *p = strstr(g_gamestate, pat);
+    if (!p) return 0;
+    return atoi(p + strlen(pat));
+}
+static void GsStr(const char *key, char *out, size_t sz) {
+    out[0]='\0';
+    char pat[32]; snprintf(pat,sizeof(pat),"\"%s\":\"",key);
+    const char *p = strstr(g_gamestate, pat);
+    if (!p) return;
+    p += strlen(pat); size_t o=0;
+    while (*p && *p!='"' && o<sz-1) out[o++]=*p++;
+    out[o]='\0';
 }
 
 // URL-encode a chat message (spaces and specials) into out.
@@ -184,6 +357,68 @@ static int RunCapture(const char *cmd, char *out, size_t outSize)
     return 1;
 }
 
+// Minimal JSON string-field extractor: finds "key":"value" and copies value.
+static int JsonGetStr(const char *json, const char *key, char *out, size_t outSize)
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p = strchr(p + strlen(pat), ':'); if (!p) return 0; p++;
+    while (*p == ' ') p++;
+    if (*p != '"') return 0; p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o < outSize - 1) out[o++] = *p++;
+    out[o] = '\0';
+    return 1;
+}
+static int JsonIsTrue(const char *json, const char *key)
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p = strchr(p + strlen(pat), ':'); if (!p) return 0;
+    p++;
+    while (*p == ' ') p++;
+    return strncmp(p, "true", 4) == 0;
+}
+
+// Call /login or /register on the AUTH server using a POST body so the password
+// never appears in the URL or process args. Writes the password to a temp file
+// and has curl send it, then deletes it. On success, stores the session token.
+static int AuthRequest(const char *action, const char *name, const char *pw,
+                       char *errOut, size_t errSize)
+{
+    char cmd[1024], out[1024];
+#if defined(_WIN32)
+    // Windows cmd: inline JSON, escaping the inner double-quotes as \" so they
+    // survive cmd.exe. This is the standard Windows curl JSON pattern.
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -m 8 -X POST -H \"Content-Type: application/json\" "
+        "-d \"{\\\"name\\\":\\\"%s\\\",\\\"pw\\\":\\\"%s\\\"}\" \"%s/%s\"",
+        name, pw, g_authURL, action);
+#else
+    // Unix shell: single-quote the JSON so the inner double-quotes are literal.
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -m 8 -X POST -H 'Content-Type: application/json' "
+        "-d '{\"name\":\"%s\",\"pw\":\"%s\"}' '%s/%s'",
+        name, pw, g_authURL, action);
+#endif
+    int ok = RunCapture(cmd, out, sizeof(out));
+
+    if (!ok || out[0] == '\0') {
+        snprintf(errOut, errSize, "No response (is the auth server running?)");
+        return 0;
+    }
+    if (JsonIsTrue(out, "ok")) {
+        JsonGetStr(out, "token", g_token, sizeof(g_token));
+        return 1;
+    }
+    char reason[200] = "login failed";
+    JsonGetStr(out, "err", reason, sizeof(reason));
+    snprintf(errOut, errSize, "%s", reason);
+    return 0;
+}
+
 #if defined(_WIN32)
   #define ASSET_NAME "black.exe"
 #else
@@ -243,7 +478,7 @@ static void CheckForUpdate(void)
 #endif
     if (!RunCapture(cmd, latest, sizeof(latest)) || latest[0] == '\0') {
         snprintf(g_updateMsg, sizeof(g_updateMsg),
-                 "Could not check (no internet or no releases yet).");
+                 "No release published yet (this is normal).");
         return;
     }
     if (strcmp(latest, APP_VERSION) == 0) {
@@ -257,15 +492,20 @@ static void CheckForUpdate(void)
 int main(void)
 {
     // Start in a normal resizable window. Press F11 to toggle fullscreen.
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);  // 4x antialiasing
     InitWindow(1280, 720, "Desktop");
     SetTargetFPS(60);
+    LoadUIFont();
 
-    Screen screen = LoadUsername() ? SCREEN_DESKTOP : SCREEN_USERNAME;
+    // Always start at the login screen. We pre-fill the last username for
+    // convenience, but never store the password, so the user logs in each run.
+    LoadUsername();
+    LoadAuthURL();
+    Screen screen = SCREEN_USERNAME;
     LoadServerURL();
     double nextPoll = 0.0;   // poll the lobby server on a timer
 
-    bool voiceOK = voice_init();   // mic + speaker + UDP socket
+    bool voiceOK = voice_init(g_username);   // mic + speaker + UDP socket (tagged with our name)
 
     const char *label = "Folder";
     Rectangle icon = { 80, 80, 90, 70 };
@@ -288,20 +528,36 @@ int main(void)
     bool typing = false;
     char chatInput[200] = "";
 
+    // Login/register screen state
+    char loginPw[64] = "";
+    int  loginField = 0;          // 0 = username box, 1 = password box
+    bool registerMode = false;    // false = log in, true = create account
+    char authErr[128] = "";
+    bool authBusy = false;
+    bool profileOpen = false;     // profile dropdown open on the desktop
+    bool settingsOpen = false;    // settings panel open in the lobby
+    bool micMuted = false;        // mute push-to-talk entirely
+    bool bg3d = false;            // animated 3D background on the desktop
+    char selectedProfile[32] = ""; // name of the cube the user clicked (profile card)
+    int  masterVol = 100;          // master output volume 0..200
+
     while (!WindowShouldClose())
     {
         if (g_quitForUpdate && quitAt < 0) quitAt = GetTime() + 1.5;
         if (quitAt > 0 && GetTime() >= quitAt) break;
 
+        t += GetFrameTime();   // global animation clock (desktop + lobby)
+
         if (IsKeyPressed(KEY_F11)) ToggleFullscreen();
 
         // Voice: hold V to talk; always drain incoming audio.
-        if (voiceOK) { voice_set_talking(IsKeyDown(KEY_V)); voice_poll(); }
+        if (voiceOK) { voice_set_master(masterVol); voice_set_talking(!micMuted && IsKeyDown(KEY_V)); voice_poll(); }
 
         // Heartbeat + refresh online list every 2 seconds once we have a name.
         if (g_username[0] && GetTime() >= nextPoll) {
             PollLobby();
             ReadOnlineFile();
+            if (screen == SCREEN_GAME) { GameJoin(); GamePoll(); }  // keep slot + refresh match
             nextPoll = GetTime() + 2.0;
         }
 
@@ -310,124 +566,247 @@ int main(void)
 
         if (screen == SCREEN_USERNAME)
         {
+            // Tab / click switches which field has focus.
+            if (IsKeyPressed(KEY_TAB)) loginField ^= 1;
+
+            // Type into the focused field.
+            char *target = (loginField == 0) ? g_username : loginPw;
+            size_t cap   = (loginField == 0) ? sizeof(g_username) : sizeof(loginPw);
             int c = GetCharPressed();
             while (c > 0) {
-                size_t len = strlen(g_username);
-                if (c >= 32 && c < 127 && len < sizeof(g_username) - 1) {
-                    g_username[len] = (char)c;
-                    g_username[len + 1] = '\0';
-                }
+                size_t len = strlen(target);
+                if (c >= 32 && c < 127 && len < cap - 1) { target[len] = (char)c; target[len+1] = '\0'; }
                 c = GetCharPressed();
             }
             if (IsKeyPressed(KEY_BACKSPACE)) {
-                size_t len = strlen(g_username);
-                if (len > 0) g_username[len - 1] = '\0';
+                size_t len = strlen(target);
+                if (len > 0) target[len-1] = '\0';
             }
 
-            Rectangle field = { W*0.5f - 200, H*0.5f - 20, 400, 44 };
-            Rectangle go    = { W*0.5f - 80,  H*0.5f + 50, 160, 44 };
-            bool hoverGo = CheckCollisionPointRec(m, go);
-            bool canGo   = strlen(g_username) > 0;
+            Rectangle uBox = { W*0.5f - 150, H*0.5f - 58, 300, 38 };
+            Rectangle pBox = { W*0.5f - 150, H*0.5f - 8,  300, 38 };
+            Rectangle go   = { W*0.5f - 150, H*0.5f + 46, 300, 40 };
+            Rectangle swap = { W*0.5f - 150, H*0.5f + 96, 300, 26 };
 
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                if (CheckCollisionPointRec(m, uBox)) loginField = 0;
+                else if (CheckCollisionPointRec(m, pBox)) loginField = 1;
+                else if (CheckCollisionPointRec(m, swap)) { registerMode = !registerMode; authErr[0] = '\0'; }
+            }
+
+            bool canGo = strlen(g_username) > 0 && strlen(loginPw) > 0 && !authBusy;
             bool submit = false;
             if (IsKeyPressed(KEY_ENTER) && canGo) submit = true;
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && hoverGo && canGo) submit = true;
-            if (submit) { SaveUsername(); screen = SCREEN_DESKTOP; }
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(m, go) && canGo) submit = true;
+
+            if (submit) {
+                authBusy = true; authErr[0] = '\0';
+                int ok = AuthRequest(registerMode ? "register" : "login",
+                                     g_username, loginPw, authErr, sizeof(authErr));
+                authBusy = false;
+                if (ok) {
+                    SaveUsername();        // remember the name locally for convenience
+                    loginPw[0] = '\0';     // never keep the password in memory
+                    screen = SCREEN_DESKTOP;
+                }
+            }
 
             BeginDrawing();
-                ClearBackground(BLACK);
-                const char *title = "Create a username";
-                int ts = 30, ttw = MeasureText(title, ts);
-                DrawText(title, W/2 - ttw/2, (int)(H*0.5f - 90), ts, RAYWHITE);
+                ClearBackground((Color){16,17,21,255});
+                const char *title = registerMode ? "Create account" : "Sign in";
+                int ts = 24;
+                Txt(title, W/2 - TxtW(title, ts)/2, (int)(H*0.5f - 110), ts, (Color){210,213,222,255});
 
-                DrawRectangleRounded(field, 0.25f, 6, (Color){30,30,36,255});
-                DrawRectangleRoundedLines(field, 0.25f, 6, (Color){90,90,110,255});
-                char shown[40];
-                snprintf(shown, sizeof(shown), "%s%s", g_username,
-                         (((int)(GetTime()*2)) % 2) ? "_" : "");
-                DrawText(shown, (int)field.x + 14, (int)field.y + 12, 22, RAYWHITE);
+                // username box
+                DrawRectangleRounded(uBox, 0.18f, 6, (Color){26,27,33,255});
+                DrawRectangleRoundedLines(uBox, 0.18f, 6,
+                    loginField==0 ? (Color){110,115,130,255} : (Color){56,58,68,255});
+                char ub[40]; snprintf(ub, sizeof(ub), "%s%s", g_username,
+                    (loginField==0 && ((int)(GetTime()*2))%2) ? "_" : "");
+                Txt(g_username[0]?ub:"username", (int)uBox.x+14, (int)uBox.y+9, 19,
+                    g_username[0]?(Color){220,222,230,255}:(Color){95,98,110,255});
 
-                Color gbg = !canGo ? (Color){50,50,55,255}
-                                   : (hoverGo ? (Color){70,140,90,255} : (Color){55,110,70,255});
-                DrawRectangleRounded(go, 0.3f, 6, gbg);
-                DrawRectangleRoundedLines(go, 0.3f, 6, (Color){120,170,130,255});
-                const char *gt = "Continue";
-                int gtw = MeasureText(gt, 20);
-                DrawText(gt, (int)(go.x + go.width/2 - gtw/2), (int)(go.y + 12), 20, RAYWHITE);
+                // password box (masked)
+                DrawRectangleRounded(pBox, 0.18f, 6, (Color){26,27,33,255});
+                DrawRectangleRoundedLines(pBox, 0.18f, 6,
+                    loginField==1 ? (Color){110,115,130,255} : (Color){56,58,68,255});
+                char stars[64]; size_t pl = strlen(loginPw);
+                for (size_t i=0;i<pl && i<sizeof(stars)-2;i++) stars[i]='*';
+                stars[pl<sizeof(stars)-2?pl:sizeof(stars)-2]='\0';
+                if (loginField==1 && ((int)(GetTime()*2))%2) strncat(stars,"_",2);
+                Txt(loginPw[0]?stars:"password", (int)pBox.x+14, (int)pBox.y+9, 19,
+                    loginPw[0]?(Color){220,222,230,255}:(Color){95,98,110,255});
 
-                DrawText("Saved on this computer. You can change it later.",
-                         W/2 - MeasureText("Saved on this computer. You can change it later.", 14)/2,
-                         (int)(go.y + go.height + 16), 14, GRAY);
+                // submit button (flat, muted)
+                Color gbg = !canGo ? (Color){34,35,42,255} : (Color){48,72,110,255};
+                DrawRectangleRounded(go, 0.18f, 6, gbg);
+                DrawRectangleRoundedLines(go, 0.18f, 6, (Color){70,90,125,160});
+                const char *gt = authBusy ? "Please wait..." : (registerMode ? "Create account" : "Sign in");
+                Txt(gt, (int)(go.x + go.width/2 - TxtW(gt,17)/2), (int)(go.y+11), 17,
+                    canGo ? (Color){225,228,236,255} : (Color){120,123,133,255});
+
+                // toggle login/register
+                const char *sw = registerMode ? "Have an account? Sign in"
+                                              : "New here? Create an account";
+                Txt(sw, (int)(swap.x + swap.width/2 - TxtW(sw,14)/2), (int)swap.y+5, 14, (Color){120,140,180,255});
+
+                // error message
+                if (authErr[0])
+                    Txt(authErr, W/2 - TxtW(authErr,14)/2, (int)(H*0.5f + 130), 14, (Color){190,120,120,255});
+
+                Txt("Tab to switch fields", W/2 - TxtW("Tab to switch fields",13)/2, (int)(H*0.5f - 142), 13, (Color){95,98,110,255});
             EndDrawing();
         }
         else if (screen == SCREEN_DESKTOP)
         {
-            Rectangle btn   = { (float)(W - 170), (float)(H - 60), 150, 40 };
-            Rectangle lobby = { (float)(W - 170), (float)(H - 130), 150, 50 };
+            Rectangle btn   = { (float)(W - 150), (float)(H - 52), 130, 34 };
+            Rectangle lobby = { (float)(W - 150), (float)(H - 98), 130, 38 };
+            // Profile avatar (circle) top-right is now the single menu for
+            // Settings / Switch profile / Log out.
+            Vector2 avatarC = { (float)(W - 40), 40 };
+            float   avatarR = 20;
+            Rectangle ddSettings = { W - 190, 66,  170, 34 };
+            Rectangle ddSwitch   = { W - 190, 102, 170, 34 };
+            Rectangle ddLogout   = { W - 190, 138, 170, 34 };
 
             bool hoverFolder = CheckCollisionPointRec(m,
                 (Rectangle){ icon.x-10, icon.y-10, icon.width+20, icon.height+40 });
-            bool hoverBtn   = CheckCollisionPointRec(m, btn);
-            bool hoverLobby = CheckCollisionPointRec(m, lobby);
+            bool overAvatar  = CheckCollisionPointCircle(m, avatarC, avatarR);
 
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             {
-                if (hoverBtn) { strcpy(g_updateMsg, "Checking for updates..."); CheckForUpdate(); }
-                else if (hoverLobby) { screen = SCREEN_LOBBY; }
+                if (overAvatar) { profileOpen = !profileOpen; }
+                else if (profileOpen && CheckCollisionPointRec(m, ddSettings)) {
+                    settingsOpen = !settingsOpen; profileOpen = false;
+                }
+                else if (profileOpen && CheckCollisionPointRec(m, ddSwitch)) {
+                    g_token[0]='\0'; loginPw[0]='\0'; authErr[0]='\0'; loginField=0;
+                    profileOpen = false; screen = SCREEN_USERNAME;
+                }
+                else if (profileOpen && CheckCollisionPointRec(m, ddLogout)) {
+                    g_token[0]='\0'; loginPw[0]='\0'; authErr[0]='\0'; loginField=0;
+                    profileOpen = false; screen = SCREEN_USERNAME;
+                }
                 else if (hoverFolder) {
-                    selected = true;
+                    selected = true; profileOpen = false;
                     double now = GetTime();
                     if (now - lastClick <= DOUBLE_CLICK) opened = !opened;
                     lastClick = now;
-                } else selected = false;
+                } else { selected = false; profileOpen = false; }
             }
 
             BeginDrawing();
-                ClearBackground(BLACK);
+                ClearBackground(BLACK);   // pure black behind the 3D scene
+
+                // --- Optional animated 3D background ---
+                if (bg3d) {
+                    Camera3D bgCam = { 0 };
+                    bgCam.position   = (Vector3){ 0.0f, 0.0f, 8.0f };
+                    bgCam.target     = (Vector3){ 0.0f, 0.0f, 0.0f };
+                    bgCam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
+                    bgCam.fovy       = 45.0f;
+                    bgCam.projection = CAMERA_PERSPECTIVE;
+
+                    BeginMode3D(bgCam);
+                        // a slowly tumbling wireframe object
+                        rlPushMatrix();
+                            rlRotatef(t * 18.0f, 1.0f, 0.0f, 0.0f);
+                            rlRotatef(t * 26.0f, 0.0f, 1.0f, 0.0f);
+                            DrawCubeWires((Vector3){0,0,0}, 3.0f, 3.0f, 3.0f, (Color){60,110,200,180});
+                            DrawSphereWires((Vector3){0,0,0}, 2.0f, 10, 10, (Color){40,70,140,120});
+                        rlPopMatrix();
+                        // a few orbiting points of light
+                        for (int i = 0; i < 6; i++) {
+                            float a = t * 0.6f + i * 1.047f;
+                            Vector3 p = { cosf(a)*4.5f, sinf(a*1.3f)*2.0f, sinf(a)*4.5f };
+                            DrawSphere(p, 0.08f, (Color){120,160,230,220});
+                        }
+                    EndMode3D();
+                }
 
                 Rectangle hit = { icon.x-10, icon.y-10, icon.width+20, icon.height+40 };
                 if (selected)      DrawRectangleRounded(hit, 0.15f, 6, (Color){60,90,140,120});
                 else if (hoverFolder) DrawRectangleRounded(hit, 0.15f, 6, (Color){40,40,40,120});
 
                 DrawFolder(icon, (Color){235,200,90,255}, (Color){220,185,75,255});
-                int fs = 18, tw = MeasureText(label, fs);
-                DrawText(label, (int)(icon.x+icon.width/2 - tw/2), (int)(icon.y+icon.height+6), fs, RAYWHITE);
-
-                char who[48];
-                snprintf(who, sizeof(who), "Signed in: %s", g_username);
-                DrawText(who, W - 20 - MeasureText(who, 16), 16, 16, (Color){170,170,180,255});
+                int fs = 20, tw = TxtW(label, fs);
+                Txt(label, (int)(icon.x+icon.width/2 - tw/2), (int)(icon.y+icon.height+6), fs, RAYWHITE);
 
                 if (opened) {
                     Rectangle win = { W*0.5f-300, H*0.5f-200, 600, 400 };
                     DrawRectangleRounded(win, 0.04f, 8, (Color){25,25,28,255});
                     DrawRectangleRoundedLines(win, 0.04f, 8, (Color){80,80,90,255});
-                    DrawText(label, (int)win.x+16, (int)win.y+12, 20, RAYWHITE);
-                    DrawText("(empty)", (int)win.x+16, (int)win.y+50, 16, GRAY);
+                    Txt(label, (int)win.x+16, (int)win.y+12, 20, RAYWHITE);
+                    Txt("(empty)", (int)win.x+16, (int)win.y+50, 16, GRAY);
                 }
 
-                Color lbg = hoverLobby ? (Color){200,60,60,255} : (Color){150,40,40,255};
-                DrawRectangleRounded(lobby, 0.3f, 6, lbg);
-                DrawRectangleRoundedLines(lobby, 0.3f, 6, (Color){230,120,120,255});
-                const char *ltxt = "Enter Lobby";
-                int ltw = MeasureText(ltxt, 18);
-                DrawText(ltxt, (int)(lobby.x+lobby.width/2 - ltw/2), (int)(lobby.y+16), 18, RAYWHITE);
-
-                Color bg = hoverBtn ? (Color){70,70,80,255} : (Color){45,45,52,255};
-                DrawRectangleRounded(btn, 0.3f, 6, bg);
-                DrawRectangleRoundedLines(btn, 0.3f, 6, (Color){90,90,100,255});
-                const char *btnTxt = "Check for Update";
-                int btw = MeasureText(btnTxt, 16);
-                DrawText(btnTxt, (int)(btn.x+btn.width/2 - btw/2), (int)(btn.y+12), 16, RAYWHITE);
-                DrawText(APP_VERSION, (int)btn.x, (int)(btn.y-22), 14, GRAY);
+                // Lobby + Update buttons (muted, flat)
+                if (Button(lobby, "Enter Lobby", 17, (Color){34,36,44,255}, (Color){46,49,60,255}, (Color){225,227,233,255}, m))
+                    screen = SCREEN_LOBBY;
+                if (Button(btn, "Check for Update", 15, (Color){26,27,33,255}, (Color){38,40,48,255}, (Color){180,183,193,255}, m)) {
+                    strcpy(g_updateMsg, "Checking for updates..."); CheckForUpdate();
+                }
+                Txt(APP_VERSION, (int)btn.x, (int)(btn.y-22), 14, (Color){110,112,122,255});
                 if (g_updateMsg[0]) {
-                    int mw = MeasureText(g_updateMsg, 14);
-                    DrawText(g_updateMsg, W-20-mw, H-160, 14, (Color){200,200,210,255});
+                    int mw = TxtW(g_updateMsg, 14);
+                    Txt(g_updateMsg, W-20-mw, H-150, 14, (Color){150,153,163,255});
+                }
+
+                // --- Profile avatar (the single menu) ---
+                Color av = overAvatar ? (Color){70,74,88,255} : (Color){52,55,66,255};
+                DrawCircleV(avatarC, avatarR, av);
+                DrawCircleLines((int)avatarC.x, (int)avatarC.y, avatarR, (Color){95,100,115,255});
+                char initial[2] = { (char)(g_username[0] ? toupper((unsigned char)g_username[0]) : '?'), '\0' };
+                Txt(initial, (int)(avatarC.x - TxtW(initial,18)/2), (int)(avatarC.y - 10), 18, (Color){210,213,222,255});
+
+                // --- Avatar dropdown: Settings / Switch profile / Log out ---
+                if (profileOpen) {
+                    Rectangle dd = { W - 200, 64, 190, 116 };
+                    DrawRectangleRounded(dd, 0.08f, 8, (Color){24,25,31,255});
+                    DrawRectangleRoundedLines(dd, 0.08f, 8, (Color){70,72,84,255});
+                    if (CheckCollisionPointRec(m, ddSettings)) DrawRectangleRounded(ddSettings, 0.2f, 6, (Color){40,42,52,255});
+                    if (CheckCollisionPointRec(m, ddSwitch))   DrawRectangleRounded(ddSwitch,   0.2f, 6, (Color){40,42,52,255});
+                    if (CheckCollisionPointRec(m, ddLogout))   DrawRectangleRounded(ddLogout,   0.2f, 6, (Color){40,42,52,255});
+                    Txt("Settings",       (int)ddSettings.x+12, (int)ddSettings.y+9, 15, (Color){210,213,222,255});
+                    Txt("Switch profile", (int)ddSwitch.x+12,   (int)ddSwitch.y+9,   15, (Color){210,213,222,255});
+                    Txt("Log out",        (int)ddLogout.x+12,   (int)ddLogout.y+9,   15, (Color){190,150,150,255});
+                }
+
+                // --- Settings panel (opened from the avatar menu) ---
+                if (settingsOpen) {
+                    Rectangle sp = { W*0.5f - 150, H*0.5f - 130, 300, 248 };
+                    DrawRectangle(0,0,W,H,(Color){0,0,0,110});
+                    DrawRectangleRounded(sp, 0.05f, 8, (Color){22,23,29,255});
+                    DrawRectangleRoundedLines(sp, 0.05f, 8, (Color){68,70,82,255});
+                    Txt("Settings", (int)sp.x+18, (int)sp.y+14, 18, (Color){205,208,218,255});
+
+                    Txt(TextFormat("Output volume: %d%%", masterVol), (int)sp.x+18, (int)sp.y+48, 14, (Color){150,153,163,255});
+                    masterVol = Slider((Rectangle){sp.x+18, sp.y+68, sp.width-36, 20}, masterVol, 200, m);
+
+                    Rectangle muteBtn = { sp.x+18, sp.y+100, sp.width-36, 34 };
+                    if (Button(muteBtn, micMuted ? "Microphone: muted" : "Microphone: on", 14,
+                               (Color){30,32,40,255}, (Color){42,45,55,255},
+                               micMuted ? (Color){195,150,150,255} : (Color){170,200,180,255}, m))
+                        micMuted = !micMuted;
+
+                    Rectangle bgB = { sp.x+18, sp.y+140, sp.width-36, 34 };
+                    if (Button(bgB, bg3d ? "3D background: on" : "3D background: off", 14,
+                               (Color){30,32,40,255}, (Color){42,45,55,255},
+                               bg3d ? (Color){170,185,215,255} : (Color){150,153,163,255}, m))
+                        bg3d = !bg3d;
+
+                    Rectangle fsB = { sp.x+18, sp.y+180, sp.width-36, 34 };
+                    if (Button(fsB, "Fullscreen", 14, (Color){30,32,40,255}, (Color){42,45,55,255}, (Color){180,183,193,255}, m))
+                        ToggleFullscreen();
+
+                    Rectangle clB = { sp.x+sp.width-38, sp.y+10, 28, 28 };
+                    if (Button(clB, "X", 15, (Color){34,35,42,255}, (Color){46,48,58,255}, (Color){190,193,203,255}, m))
+                        settingsOpen = false;
                 }
             EndDrawing();
         }
-        else // SCREEN_LOBBY
+        else if (screen == SCREEN_LOBBY)
         {
-            t += GetFrameTime();
 
             // ---- Chat typing ----
             if (typing) {
@@ -463,47 +842,58 @@ int main(void)
             BeginDrawing();
                 ClearBackground(RAYWHITE);
 
-                // Count how many people are online (non-empty lines).
-                int people = 0;
+                // Parse online names into an array.
+                char namebuf[2048];
+                strncpy(namebuf, g_online, sizeof(namebuf)-1); namebuf[sizeof(namebuf)-1]='\0';
+                char *names[32]; int people = 0;
                 {
-                    for (const char *p = g_online; *p; ) {
-                        const char *e = p; while (*e && *e != '\n') e++;
-                        if (e > p) people++;
-                        p = (*e == '\n') ? e + 1 : e;
-                    }
+                    char *ln = strtok(namebuf, "\n");
+                    while (ln && people < 32) { if (ln[0]) names[people++] = ln; ln = strtok(NULL, "\n"); }
+                }
+
+                // Compute each person-cube's world position (slow rotation).
+                Vector3 cubeWorld[32];
+                float radius = 3.5f;
+                for (int i = 0; i < people; i++) {
+                    float a = (6.2831853f * i / (people > 0 ? people : 1)) + t * 0.12f; // slower spin
+                    cubeWorld[i] = (Vector3){ cosf(a)*radius, 0.6f + sinf(t*0.8f + i)*0.12f, sinf(a)*radius };
                 }
 
                 BeginMode3D(cam);
                     DrawPlane((Vector3){0,0,0}, (Vector2){20,20}, (Color){235,235,235,255});
-
-                    // Big red cube (the room itself / host marker)
                     DrawCube(cubePos, 1.5f, 1.5f, 1.5f, RED);
                     DrawCubeWires(cubePos, 1.5f, 1.5f, 1.5f, MAROON);
-
-                    // One small cube per online person, in a slowly rotating ring.
-                    float radius = 3.5f;
                     for (int i = 0; i < people; i++) {
-                        float a = (6.2831853f * i / (people > 0 ? people : 1)) + t * 0.5f;
-                        Vector3 p = {
-                            cosf(a) * radius,
-                            0.6f + sinf(t * 2.0f + i) * 0.15f,  // gentle bob
-                            sinf(a) * radius
-                        };
-                        DrawCube(p, 0.7f, 0.7f, 0.7f, (Color){60,90,200,255});
-                        DrawCubeWires(p, 0.7f, 0.7f, 0.7f, (Color){30,50,140,255});
+                        bool isMe = (strcmp(names[i], g_username) == 0);
+                        Color cc = isMe ? (Color){80,170,110,255} : (Color){60,90,200,255};
+                        DrawCube(cubeWorld[i], 0.7f, 0.7f, 0.7f, cc);
+                        DrawCubeWires(cubeWorld[i], 0.7f, 0.7f, 0.7f, (Color){30,50,140,255});
                     }
                 EndMode3D();
 
-                DrawText("LOBBY", 20, H-50, 28, (Color){40,40,40,255});
+                // Project cubes to screen; draw name tags + handle clicks.
+                for (int i = 0; i < people; i++) {
+                    Vector2 sp = GetWorldToScreen(cubeWorld[i], cam);
+                    int tw = TxtW(names[i], 16);
+                    Txt(names[i], (int)(sp.x - tw/2), (int)(sp.y - 50), 16, (Color){40,40,50,255});
+                    // clickable region around the cube on screen
+                    Rectangle hitR = { sp.x - 35, sp.y - 35, 70, 70 };
+                    if (CheckCollisionPointRec(m, hitR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                        strncpy(selectedProfile, names[i], sizeof(selectedProfile)-1);
+                }
+
+                Txt("LOBBY", 20, H-50, 28, (Color){40,40,40,255});
 
                 // Push-to-talk hint / indicator
                 if (!voiceOK) {
-                    DrawText("voice off (mic/socket failed)", 20, H-78, 16, (Color){170,90,90,255});
+                    Txt("voice off (mic/socket failed)", 20, H-78, 16, (Color){170,90,90,255});
+                } else if (micMuted) {
+                    Txt("Mic muted (Settings to unmute)", 20, H-100, 18, (Color){170,90,90,255});
                 } else if (voice_is_talking()) {
                     DrawCircle(40, H-92, 10, (Color){220,40,40,255});
-                    DrawText("TALKING (hold V)", 60, H-100, 18, (Color){200,40,40,255});
+                    Txt("TALKING (hold V)", 60, H-100, 18, (Color){200,40,40,255});
                 } else {
-                    DrawText("Hold V to talk", 20, H-100, 18, (Color){90,90,90,255});
+                    Txt("Hold V to talk", 20, H-100, 18, (Color){90,90,90,255});
                 }
 
                 // ---- Online panel (top-right): live list from the server ----
@@ -515,7 +905,7 @@ int main(void)
                     int ph = 50 + (count > 0 ? count : 1) * 22;
                     DrawRectangleRounded((Rectangle){px,py,pw,ph}, 0.08f, 6, (Color){245,245,245,235});
                     DrawRectangleRoundedLines((Rectangle){px,py,pw,ph}, 0.08f, 6, (Color){180,180,180,255});
-                    DrawText("Online", px+14, py+10, 20, (Color){40,40,40,255});
+                    Txt("Online", px+14, py+10, 20, (Color){40,40,40,255});
 
                     // draw each line
                     char buf[2048];
@@ -526,16 +916,39 @@ int main(void)
                     while (line) {
                         if (line[0]) {
                             bool me = (strcmp(line, g_username) == 0);
-                            DrawText(me ? TextFormat("%s (you)", line) : line,
+                            Txt(me ? TextFormat("%s (you)", line) : line,
                                      px+18, y, 16, me ? (Color){40,110,60,255} : (Color){60,60,60,255});
                             y += 22; shown++;
                         }
                         line = strtok(NULL, "\n");
                     }
                     if (shown == 0)
-                        DrawText("(connecting...)", px+18, y, 14, GRAY);
+                        Txt("(connecting...)", px+18, y, 14, GRAY);
+
+                    // ---- Friends panel, just below Online ----
+                    int fpy = py + ph + 12;
+                    int fcount = 0;
+                    for (const char *p = g_friends; *p; p++) if (*p=='\n') fcount++;
+                    int fph = 44 + (fcount>0?fcount:1)*22;
+                    DrawRectangleRounded((Rectangle){px,fpy,pw,fph}, 0.08f, 6, (Color){245,245,245,235});
+                    DrawRectangleRoundedLines((Rectangle){px,fpy,pw,fph}, 0.08f, 6, (Color){180,180,180,255});
+                    Txt("Friends", px+14, fpy+10, 18, (Color){40,40,40,255});
+                    char fbuf[2048]; strncpy(fbuf, g_friends, sizeof(fbuf)-1); fbuf[sizeof(fbuf)-1]='\0';
+                    int fy = fpy + 38, fsh = 0;
+                    char *fl = strtok(fbuf, "\n");
+                    while (fl) {
+                        if (fl[0]) {
+                            // green if that friend is currently online
+                            int online = (strstr(g_online, fl) != NULL);
+                            Txt(fl, px+18, fy, 15, online ? (Color){40,140,70,255} : (Color){130,130,140,255});
+                            if (online) Txt("online", px+pw-58, fy, 12, (Color){40,140,70,255});
+                            fy += 22; fsh++;
+                        }
+                        fl = strtok(NULL, "\n");
+                    }
+                    if (fsh == 0) Txt("(none yet)", px+18, fy, 13, GRAY);
                 }
-                DrawText(TextFormat("server: %s", g_serverURL), 20, H-20, 14, GRAY);
+                Txt(TextFormat("server: %s", g_serverURL), 20, H-20, 14, GRAY);
 
                 // ---- Floating chat bubble (gently bobs) ----
                 {
@@ -547,7 +960,7 @@ int main(void)
                     // little tail to make it a speech bubble
                     DrawTriangle((Vector2){bx+30,by+bh}, (Vector2){bx+60,by+bh},
                                  (Vector2){bx+25,by+bh+22}, (Color){255,255,255,235});
-                    DrawText("Chat", (int)bx+14, (int)by+8, 18, (Color){60,60,70,255});
+                    Txt("Chat", (int)bx+14, (int)by+8, 18, (Color){60,60,70,255});
 
                     // last few chat lines
                     char cbuf[4096];
@@ -560,29 +973,184 @@ int main(void)
                     int start = nl > MAXL ? nl - MAXL : 0;
                     int yy = (int)by + 36;
                     for (int i = start; i < nl; i++) {
-                        DrawText(lines[i % 64], (int)bx+14, yy, 14, (Color){50,50,60,255});
+                        Txt(lines[i % 64], (int)bx+14, yy, 14, (Color){50,50,60,255});
                         yy += 20;
                     }
-                    if (nl == 0) DrawText("(no messages yet)", (int)bx+14, yy, 14, GRAY);
+                    if (nl == 0) Txt("(no messages yet)", (int)bx+14, yy, 14, GRAY);
 
                     // input row
                     if (typing) {
                         DrawRectangle((int)bx+10, (int)by+bh-30, bw-20, 24, (Color){235,238,245,255});
-                        DrawText(TextFormat("%s_", chatInput), (int)bx+14, (int)by+bh-26, 14, (Color){20,20,30,255});
+                        Txt(TextFormat("%s_", chatInput), (int)bx+14, (int)by+bh-26, 14, (Color){20,20,30,255});
                     } else {
-                        DrawText("Press T to chat", (int)bx+14, (int)by+bh-26, 14, (Color){130,130,140,255});
+                        Txt("Press T to chat", (int)bx+14, (int)by+bh-26, 14, (Color){130,130,140,255});
                     }
                 }
 
                 Color bbg = hoverBack ? (Color){200,200,200,255} : (Color){220,220,220,255};
                 DrawRectangleRounded(back, 0.3f, 6, bbg);
                 DrawRectangleRoundedLines(back, 0.3f, 6, (Color){150,150,150,255});
-                DrawText("< Back", 34, 28, 18, (Color){40,40,40,255});
+                Txt("< Back", 34, 28, 18, (Color){40,40,40,255});
+
+                // ---- Play 1v1 button (top-center) ----
+                {
+                    Rectangle pvp = { W*0.5f - 90, 24, 180, 40 };
+                    if (Button(pvp, "Play 1v1", 18, (Color){40,42,52,255}, (Color){54,57,70,255}, (Color){225,227,233,255}, m)) {
+                        GameJoin();
+                        screen = SCREEN_GAME;
+                    }
+                }
+
+                // ---- Profile card (when a cube is clicked) ----
+                if (selectedProfile[0]) {
+                    Rectangle pc = { W*0.5f - 170, H*0.5f - 175, 340, 350 };
+                    DrawRectangle(0, 0, W, H, (Color){0,0,0,110});   // dim behind
+                    DrawRectangleRounded(pc, 0.05f, 8, (Color){26,27,33,255});
+                    DrawRectangleRoundedLines(pc, 0.05f, 8, (Color){70,72,84,255});
+
+                    bool isSelf = (strcmp(selectedProfile, g_username) == 0);
+
+                    // avatar circle with initial
+                    Vector2 ac = { pc.x + pc.width/2, pc.y + 60 };
+                    DrawCircleV(ac, 34, (Color){52,55,66,255});
+                    DrawCircleLines((int)ac.x, (int)ac.y, 34, (Color){95,100,115,255});
+                    char ini[2] = { (char)toupper((unsigned char)selectedProfile[0]), '\0' };
+                    Txt(ini, (int)(ac.x - TxtW(ini,30)/2), (int)(ac.y - 16), 30, (Color){215,218,226,255});
+
+                    int nw = TxtW(selectedProfile, 22);
+                    Txt(selectedProfile, (int)(pc.x + pc.width/2 - nw/2), (int)(pc.y+104), 22, (Color){220,222,230,255});
+                    const char *status = "Online";
+                    Txt(status, (int)(pc.x + pc.width/2 - TxtW(status,13)/2), (int)(pc.y+134), 13, (Color){120,170,135,255});
+
+                    if (isSelf) {
+                        Txt("(this is you)", (int)(pc.x+pc.width/2 - TxtW("(this is you)",14)/2),
+                            (int)(pc.y+170), 14, (Color){110,113,125,255});
+                    } else {
+                        // Per-person volume
+                        int pv = voice_get_peer_volume(selectedProfile);
+                        Txt(TextFormat("Volume: %d%%", pv), (int)pc.x+24, (int)pc.y+168, 14, (Color){150,153,163,255});
+                        Rectangle pvSld = { pc.x+24, pc.y+188, pc.width-48, 20 };
+                        int newpv = Slider(pvSld, pv, 200, m);
+                        if (newpv != pv) voice_set_peer_volume(selectedProfile, newpv);
+
+                        // Per-person mute
+                        int pm = voice_get_peer_mute(selectedProfile);
+                        Rectangle mB = { pc.x+24, pc.y+220, pc.width-48, 34 };
+                        if (Button(mB, pm ? "Unmute this person" : "Mute this person", 14,
+                                   (Color){32,34,42,255}, (Color){44,47,57,255},
+                                   pm ? (Color){195,150,150,255} : (Color){200,203,213,255}, m))
+                            voice_set_peer_mute(selectedProfile, !pm);
+
+                        // Add Friend / already-friend indicator
+                        Rectangle addB = { pc.x+24, pc.y+262, pc.width-48, 34 };
+                        if (IsFriend(selectedProfile)) {
+                            DrawRectangleRounded(addB, 0.16f, 6, (Color){30,40,32,255});
+                            Txt("Friends", (int)(addB.x+addB.width/2 - TxtW("Friends",14)/2), (int)(addB.y+10), 14, (Color){140,190,150,255});
+                        } else if (Button(addB, "Add Friend", 14, (Color){44,62,92,255}, (Color){56,78,114,255}, (Color){220,225,235,255}, m)) {
+                            AddFriend(selectedProfile);
+                        }
+                    }
+
+                    // Close button
+                    Rectangle clB = { pc.x+pc.width-40, pc.y+10, 28, 28 };
+                    if (Button(clB, "X", 15, (Color){34,35,42,255}, (Color){46,48,58,255}, (Color){190,193,203,255}, m))
+                        selectedProfile[0] = '\0';
+                }
+
+                // ---- Settings button (bottom-right) ----
+                Rectangle setBtn = { (float)(W - 150), (float)(H - 50), 130, 32 };
+                if (Button(setBtn, "Settings", 15, (Color){235,235,238,255}, (Color){222,222,228,255}, (Color){50,52,62,255}, m))
+                    settingsOpen = !settingsOpen;
+
+                // ---- Settings panel (audio controls) ----
+                if (settingsOpen) {
+                    Rectangle sp = { (float)(W - 300), (float)(H - 256), 280, 196 };
+                    DrawRectangleRounded(sp, 0.05f, 8, (Color){246,247,249,255});
+                    DrawRectangleRoundedLines(sp, 0.05f, 8, (Color){205,207,215,255});
+                    Txt("Audio", (int)sp.x+16, (int)sp.y+13, 17, (Color){50,52,62,255});
+
+                    // Master output volume slider
+                    Txt(TextFormat("Output volume: %d%%", masterVol), (int)sp.x+16, (int)sp.y+44, 14, (Color){90,92,104,255});
+                    Rectangle volSld = { sp.x+16, sp.y+64, sp.width-32, 20 };
+                    masterVol = Slider(volSld, masterVol, 200, m);
+
+                    // Mic toggle
+                    Rectangle muteBtn = { sp.x+16, sp.y+96, sp.width-32, 34 };
+                    if (Button(muteBtn, micMuted ? "Microphone: muted" : "Microphone: on", 14,
+                               (Color){236,238,242,255}, (Color){228,230,236,255},
+                               micMuted ? (Color){180,90,90,255} : (Color){70,120,80,255}, m))
+                        micMuted = !micMuted;
+
+                    // Fullscreen
+                    Rectangle fsB = { sp.x+16, sp.y+138, sp.width-32, 34 };
+                    if (Button(fsB, "Fullscreen", 14, (Color){236,238,242,255}, (Color){228,230,236,255}, (Color){70,72,84,255}, m))
+                        ToggleFullscreen();
+                }
+            EndDrawing();
+        }
+        else // SCREEN_GAME (1v1 arena — matchmaking shell, no shooting yet)
+        {
+            // Refresh match state on the regular poll cadence.
+            // (g_gamestate is fetched in GamePoll, called from the timer below.)
+            if (IsKeyPressed(KEY_ESCAPE)) screen = SCREEN_LOBBY;
+
+            char p0[32], p1[32], win[32];
+            GsStr("p0", p0, sizeof(p0)); GsStr("p1", p1, sizeof(p1)); GsStr("winner", win, sizeof(win));
+            int s0 = GsInt("s0"), s1 = GsInt("s1"), round = GsInt("round");
+            int filled = (p0[0]?1:0) + (p1[0]?1:0);
+
+            // Two player positions in a white box arena (placeholder cubes).
+            Camera3D gcam = { 0 };
+            gcam.position=(Vector3){0,7,10}; gcam.target=(Vector3){0,1,0};
+            gcam.up=(Vector3){0,1,0}; gcam.fovy=50; gcam.projection=CAMERA_PERSPECTIVE;
+
+            BeginDrawing();
+                ClearBackground(RAYWHITE);
+                BeginMode3D(gcam);
+                    // white box room: floor + faint walls
+                    DrawPlane((Vector3){0,0,0},(Vector2){16,16},(Color){240,240,242,255});
+                    DrawCubeWires((Vector3){0,2.5f,0},16,5,16,(Color){210,210,216,255});
+                    // player 1 (left), player 2 (right)
+                    if (p0[0]) { DrawCube((Vector3){-3,1,0},1.2f,2,1.2f,(Color){200,60,60,255});
+                                 DrawCubeWires((Vector3){-3,1,0},1.2f,2,1.2f,MAROON); }
+                    if (p1[0]) { DrawCube((Vector3){ 3,1,0},1.2f,2,1.2f,(Color){60,90,200,255});
+                                 DrawCubeWires((Vector3){ 3,1,0},1.2f,2,1.2f,(Color){30,50,140,255}); }
+                EndMode3D();
+
+                // Top bar: slot counter + scoreboard
+                char cnt[16]; snprintf(cnt,sizeof(cnt),"%d/2", filled);
+                Txt(cnt, W/2 - TxtW(cnt,28)/2, 16, 28, (Color){40,40,50,255});
+
+                // Scoreboard (best of 3)
+                Txt(p0[0]?p0:"(waiting)", 40, 60, 20, (Color){200,60,60,255});
+                Txt(TextFormat("%d", s0), 40, 88, 26, (Color){40,40,50,255});
+                Txt(p1[0]?p1:"(waiting)", W-40-TxtW(p1[0]?p1:"(waiting)",20), 60, 20, (Color){60,90,200,255});
+                Txt(TextFormat("%d", s1), W-60, 88, 26, (Color){40,40,50,255});
+                Txt(TextFormat("Round %d  ·  Best of 3", round), W/2 - TxtW("Round 1  ·  Best of 3",16)/2, 52, 16, (Color){110,110,120,255});
+
+                // Role / status line
+                const char *roleTxt = (g_myRole==2) ? "Spectating (match full)" :
+                                      (g_myRole==0||g_myRole==1) ? "You are in the match" : "Joining...";
+                Txt(roleTxt, W/2 - TxtW(roleTxt,16)/2, H-90, 16,
+                    g_myRole==2 ? (Color){150,120,60,255} : (Color){70,130,90,255});
+
+                if (win[0]) {
+                    Txt(TextFormat("%s wins the match!", win),
+                        W/2 - TxtW(TextFormat("%s wins the match!",win),26)/2, H/2-13, 26, (Color){40,40,50,255});
+                }
+
+                // Back button
+                Rectangle gback = { 20, H-50, 110, 34 };
+                if (Button(gback, "< Leave", 16, (Color){235,235,238,255}, (Color){222,222,228,255}, (Color){50,52,62,255}, m))
+                    screen = SCREEN_LOBBY;
+
+                Txt("(movement & shooting coming next)", W/2 - TxtW("(movement & shooting coming next)",13)/2, H-24, 13, (Color){150,150,160,255});
             EndDrawing();
         }
     }
 
     voice_shutdown();
+    if (g_fontOK) UnloadFont(g_font);
     CloseWindow();
     return 0;
 }

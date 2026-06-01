@@ -12,3 +12,9 @@ miniaudio.h
 desk_user.txt
 desk_online.txt
 desk_chat.txt
+desk_auth_body.tmp
+
+# SECRETS / account data — never commit these
+auth-secret.key
+auth-users.json
+users.json
