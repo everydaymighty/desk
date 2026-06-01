@@ -192,7 +192,12 @@ const server = http.createServer((req, res) => {
   if (path === "/gset") {
     const name = (parsed.query.name || "").toString().slice(0,24).trim();
     const st   = (parsed.query.st   || "").toString().slice(0,120);
-    if (name) { gstates[name] = { st, last: Date.now() }; }
+    if (name) {
+      gstates[name] = { st, last: Date.now() };
+      // also keep this player's match slot alive (worker calls /gset constantly)
+      const sl = playerSlot(name);
+      if (sl >= 0) match.players[sl].last = Date.now();
+    }
     res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n");
     return;
   }

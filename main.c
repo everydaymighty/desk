@@ -505,11 +505,25 @@ static void CheckForUpdate(void)
 
 int main(void)
 {
-    // Start in a normal resizable window. Press F11 to toggle fullscreen.
+    // Open a small window first so we can read the monitor's native resolution,
+    // then resize to fill it. The user can change resolution later in Settings.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);  // 4x antialiasing
     InitWindow(1280, 720, "Desktop");
     SetTargetFPS(60);
+    SetExitKey(KEY_NULL);   // don't let ESC close the app; we use it for navigation
     LoadUIFont();
+
+    // Detect native resolution and start at it (windowed, centered).
+    int mon = GetCurrentMonitor();
+    int nativeW = GetMonitorWidth(mon), nativeH = GetMonitorHeight(mon);
+    if (nativeW < 640 || nativeH < 480) { nativeW = 1280; nativeH = 720; } // fallback
+    // Preset resolutions to cycle in Settings (last = Native).
+    int resW[5] = { 1280, 1600, 1920, 2560, nativeW };
+    int resH[5] = {  720,  900, 1080, 1440, nativeH };
+    const char *resLabel[5] = { "1280x720", "1600x900", "1920x1080", "2560x1440", "Native" };
+    int resMode = 4;  // default to Native
+    SetWindowSize(nativeW, nativeH);
+    SetWindowPosition( (GetMonitorWidth(mon)-nativeW)/2, (GetMonitorHeight(mon)-nativeH)/2 );
 
     // Always start at the login screen. We pre-fill the last username for
     // convenience, but never store the password, so the user logs in each run.
@@ -528,6 +542,9 @@ int main(void)
     int fpHP = 100, fpScore = 0;
     bool inMatchFPS = false;                   // are we an active fighter (vs spectator)
     double nextNetSend = 0, fireCooldown = 0;
+    float shotFx = 0;        // >0 = show tracer/muzzle flash, counts down
+    bool  shotHit = false;   // last shot connected (for hitmarker)
+    Vector3 shotFrom, shotTo;// tracer endpoints
 
     const char *label = "Folder";
     Rectangle icon = { 80, 80, 90, 70 };
@@ -562,6 +579,9 @@ int main(void)
     bool bg3d = false;            // animated 3D background on the desktop
     char selectedProfile[32] = ""; // name of the cube the user clicked (profile card)
     int  masterVol = 100;          // master output volume 0..200
+    int  fpsMode = 1;              // 0=60, 1=144, 2=unlimited
+    const int fpsValues[3] = { 60, 144, 0 };
+    const char *fpsLabels[3] = { "60", "144", "Unlimited" };
 
     while (!WindowShouldClose())
     {
@@ -569,18 +589,21 @@ int main(void)
         if (quitAt > 0 && GetTime() >= quitAt) break;
 
         t += GetFrameTime();   // global animation clock (desktop + lobby)
+        SetTargetFPS(fpsValues[fpsMode]);   // 0 = unlimited
 
         if (IsKeyPressed(KEY_F11)) ToggleFullscreen();
 
         // Voice: hold V to talk; always drain incoming audio.
         if (voiceOK) { voice_set_master(masterVol); voice_set_talking(!micMuted && IsKeyDown(KEY_V)); voice_poll(); }
-        game_poll();
+        // Only poll the game network while actually in the arena, and only a few
+        // times per second — NOT every frame (blocking curl every frame = lag).
+        // Networking runs on a background thread now; nothing to do per-frame.
 
-        // Heartbeat + refresh online list every 2 seconds once we have a name.
-        if (g_username[0] && GetTime() >= nextPoll) {
+        // Heartbeat + refresh lists. Slower while in-game so the curl spawns
+        // don't hitch the framerate (the ~4s stutter you saw).
+        if (g_username[0] && GetTime() >= nextPoll && screen != SCREEN_GAME) {
             PollLobby();
             ReadOnlineFile();
-            if (screen == SCREEN_GAME) { GameJoin(); GamePoll(); }  // keep slot + refresh match
             nextPoll = GetTime() + 2.0;
         }
 
@@ -797,7 +820,7 @@ int main(void)
 
                 // --- Settings panel (opened from the avatar menu) ---
                 if (settingsOpen) {
-                    Rectangle sp = { W*0.5f - 150, H*0.5f - 130, 300, 248 };
+                    Rectangle sp = { W*0.5f - 150, H*0.5f - 170, 300, 344 };
                     DrawRectangle(0,0,W,H,(Color){0,0,0,110});
                     DrawRectangleRounded(sp, 0.05f, 8, (Color){22,23,29,255});
                     DrawRectangleRoundedLines(sp, 0.05f, 8, (Color){68,70,82,255});
@@ -818,7 +841,27 @@ int main(void)
                                bg3d ? (Color){170,185,215,255} : (Color){150,153,163,255}, m))
                         bg3d = !bg3d;
 
-                    Rectangle fsB = { sp.x+18, sp.y+180, sp.width-36, 34 };
+                    Rectangle fpsB = { sp.x+18, sp.y+180, sp.width-36, 34 };
+                    if (Button(fpsB, TextFormat("FPS limit: %s", fpsLabels[fpsMode]), 14,
+                               (Color){30,32,40,255}, (Color){42,45,55,255}, (Color){170,185,215,255}, m))
+                        fpsMode = (fpsMode + 1) % 3;
+
+                    Rectangle resB = { sp.x+18, sp.y+220, sp.width-36, 34 };
+                    if (Button(resB, TextFormat("Resolution: %s", resLabel[resMode]), 14,
+                               (Color){30,32,40,255}, (Color){42,45,55,255}, (Color){170,185,215,255}, m)) {
+                        resMode = (resMode + 1) % 5;
+                        // If fullscreen, drop to windowed so the new size is visible.
+                        if (IsWindowFullscreen()) ToggleFullscreen();
+                        int mm = GetCurrentMonitor();
+                        int rw = resW[resMode], rh = resH[resMode];
+                        // never exceed the monitor
+                        if (rw > GetMonitorWidth(mm))  rw = GetMonitorWidth(mm);
+                        if (rh > GetMonitorHeight(mm)) rh = GetMonitorHeight(mm);
+                        SetWindowSize(rw, rh);
+                        SetWindowPosition((GetMonitorWidth(mm)-rw)/2, (GetMonitorHeight(mm)-rh)/2);
+                    }
+
+                    Rectangle fsB = { sp.x+18, sp.y+260, sp.width-36, 34 };
                     if (Button(fsB, "Fullscreen", 14, (Color){30,32,40,255}, (Color){42,45,55,255}, (Color){180,183,193,255}, m))
                         ToggleFullscreen();
 
@@ -1141,14 +1184,16 @@ int main(void)
             int s0 = GsInt("s0"), s1 = GsInt("s1"), round = GsInt("round");
             int filled = (p0[0]?1:0) + (p1[0]?1:0);
 
-            // ---- Arena geometry: floor 16x16, four cover boxes ----
+            // ---- Arena geometry: bigger floor 24x24, four cover boxes ----
             #define NCOVER 4
-            Vector3 coverPos[NCOVER]  = { {-2.5f,1,-2.5f}, {2.5f,1,2.5f}, {-2.5f,1,2.5f}, {2.5f,1,-2.5f} };
-            Vector3 coverSize = { 2.0f, 2.0f, 2.0f };
+            Vector3 coverPos[NCOVER]  = { {-5,1,-5}, {5,1,5}, {-5,1,5}, {5,1,-5} };
+            Vector3 coverSize = { 2.6f, 2.0f, 2.6f };
+            Vector3 treePos = { 0, 0, 0 };        // tree trunk base at center
+            float   treeR = 0.9f;                 // collision radius around trunk
 
-            // Spawn point per slot.
+            // Spawn point per slot (further apart in the bigger room).
             if (!inMatchFPS && !spectator) {
-                fpPos = (g_myRole==1) ? (Vector3){3,1.6f,5} : (Vector3){-3,1.6f,-5};
+                fpPos = (g_myRole==1) ? (Vector3){8,1.6f,8} : (Vector3){-8,1.6f,-8};
                 fpYaw = (g_myRole==1) ? 3.14159f : 0.0f;
                 fpPitch = 0; fpHP = 100; inMatchFPS = true;
             }
@@ -1175,16 +1220,19 @@ int main(void)
                 if (IsKeyDown(KEY_S)) { np.x -= fwd.x*spd; np.z -= fwd.z*spd; }
                 if (IsKeyDown(KEY_D)) { np.x += rgt.x*spd; np.z += rgt.z*spd; }
                 if (IsKeyDown(KEY_A)) { np.x -= rgt.x*spd; np.z -= rgt.z*spd; }
-                // keep inside walls
-                if (np.x >  7.3f) np.x =  7.3f; if (np.x < -7.3f) np.x = -7.3f;
-                if (np.z >  7.3f) np.z =  7.3f; if (np.z < -7.3f) np.z = -7.3f;
-                // block cover boxes (treat me as a point at chest height)
+                // keep inside the bigger walls
+                if (np.x >  11.3f) np.x =  11.3f; if (np.x < -11.3f) np.x = -11.3f;
+                if (np.z >  11.3f) np.z =  11.3f; if (np.z < -11.3f) np.z = -11.3f;
+                // block cover boxes
                 int blocked = 0;
                 for (int i=0;i<NCOVER;i++) {
                     float hx=coverSize.x/2+0.4f, hz=coverSize.z/2+0.4f;
                     if (np.x > coverPos[i].x-hx && np.x < coverPos[i].x+hx &&
                         np.z > coverPos[i].z-hz && np.z < coverPos[i].z+hz) { blocked=1; break; }
                 }
+                // block the center tree (circular)
+                float tdx = np.x-treePos.x, tdz = np.z-treePos.z;
+                if (tdx*tdx + tdz*tdz < (treeR+0.4f)*(treeR+0.4f)) blocked = 1;
                 if (!blocked) { fpPos.x = np.x; fpPos.z = np.z; }
             }
 
@@ -1201,20 +1249,23 @@ int main(void)
             // ---- Shooting: raycast from camera toward opponent ----
             if (!spectator && !win[0] && fireCooldown <= 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 fireCooldown = 0.4f;
+                shotFx = 0.12f; shotHit = false;
+                // tracer goes from just below the eye, straight out along aim
+                shotFrom = (Vector3){ fpPos.x + dir.x*0.3f, fpPos.y - 0.2f, fpPos.z + dir.z*0.3f };
+                shotTo   = (Vector3){ fpPos.x + dir.x*40, fpPos.y + dir.y*40, fpPos.z + dir.z*40 };
                 if (haveOpp && opp.hp > 0) {
-                    // vector to opponent center (chest)
                     Vector3 oc = { opp.x, opp.y, opp.z };
                     Vector3 to = { oc.x-fpPos.x, oc.y-fpPos.y, oc.z-fpPos.z };
                     float len = sqrtf(to.x*to.x+to.y*to.y+to.z*to.z);
                     if (len > 0.001f) {
                         Vector3 tn = { to.x/len, to.y/len, to.z/len };
                         float dot = tn.x*dir.x + tn.y*dir.y + tn.z*dir.z; // 1 = dead on
-                        // aim tolerance tightens with distance; ~ hit if crosshair near them
-                        if (dot > 0.985f) game_send_hit(opp.name, 34);   // ~3 hits to kill
+                        if (dot > 0.985f) { game_send_hit(opp.name, 34); shotHit = true; shotTo = oc; }
                     }
                 }
             }
             if (fireCooldown > 0) fireCooldown -= dt;
+            if (shotFx > 0) shotFx -= dt;
 
             // ---- Take incoming damage ----
             int dmg = game_take_damage();
@@ -1242,9 +1293,10 @@ int main(void)
             if (fpHP <= 0 && GetTime() > scoreLock) { scoreLock = GetTime()+3.0; inMatchFPS=false; }
 
             // ---- Send my state ~20x/sec ----
-            if (!spectator && GetTime() >= nextNetSend) {
+            if (!spectator) {
+                // instant now (just updates shared state; worker thread sends it)
                 game_send_state(fpPos.x, fpPos.y, fpPos.z, fpYaw, fpPitch, fpHP, fpScore);
-                nextNetSend = GetTime() + 0.05;
+                (void)nextNetSend;
             }
 
             if (IsKeyPressed(KEY_ESCAPE)) { EnableCursor(); inMatchFPS=false; screen = SCREEN_LOBBY; }
@@ -1253,13 +1305,19 @@ int main(void)
             BeginDrawing();
                 ClearBackground((Color){235,236,240,255});
                 BeginMode3D(gcam);
-                    DrawPlane((Vector3){0,0,0},(Vector2){16,16},(Color){248,248,250,255});
-                    DrawCubeWires((Vector3){0,2.5f,0},16,5,16,(Color){205,207,214,255});
+                    DrawPlane((Vector3){0,0,0},(Vector2){24,24},(Color){248,248,250,255});
+                    DrawCubeWires((Vector3){0,3.0f,0},24,6,24,(Color){205,207,214,255});
                     // cover boxes
                     for (int i=0;i<NCOVER;i++){
                         DrawCubeV(coverPos[i], coverSize, (Color){200,202,210,255});
                         DrawCubeWiresV(coverPos[i], coverSize, (Color){150,152,162,255});
                     }
+                    // center tree: brown trunk + green foliage
+                    DrawCylinder(treePos, 0.5f, 0.5f, 3.0f, 12, (Color){120,82,45,255});
+                    DrawCylinderWires(treePos, 0.5f, 0.5f, 3.0f, 12, (Color){90,60,32,255});
+                    DrawSphere((Vector3){treePos.x, 3.6f, treePos.z}, 1.8f, (Color){70,150,70,255});
+                    DrawSphere((Vector3){treePos.x-1.0f, 3.0f, treePos.z+0.6f}, 1.2f, (Color){80,165,80,255});
+                    DrawSphere((Vector3){treePos.x+1.0f, 3.2f, treePos.z-0.5f}, 1.2f, (Color){60,140,60,255});
                     // opponent as a body cube + head
                     if (haveOpp && opp.hp > 0) {
                         Color oc = (Color){200,70,70,255};
@@ -1267,12 +1325,30 @@ int main(void)
                         DrawCubeWires((Vector3){opp.x,opp.y,opp.z}, 0.9f,1.6f,0.9f, MAROON);
                         DrawSphere((Vector3){opp.x,opp.y+1.0f,opp.z}, 0.35f, oc);
                     }
+                    // shot tracer (visible bullet line) + impact spark
+                    if (shotFx > 0) {
+                        DrawLine3D(shotFrom, shotTo, (Color){255,220,90,255});
+                        DrawSphere(shotTo, shotHit?0.25f:0.12f, shotHit?(Color){255,80,60,255}:(Color){255,220,90,255});
+                    }
                 EndMode3D();
 
-                // crosshair
+                // crosshair (turns red briefly on a hit)
                 if (!spectator && !win[0]) {
-                    DrawLine(W/2-10, H/2, W/2+10, H/2, (Color){40,40,50,200});
-                    DrawLine(W/2, H/2-10, W/2, H/2+10, (Color){40,40,50,200});
+                    Color ch = (shotFx>0 && shotHit) ? (Color){220,40,40,255} : (Color){40,40,50,200};
+                    DrawLine(W/2-10, H/2, W/2+10, H/2, ch);
+                    DrawLine(W/2, H/2-10, W/2, H/2+10, ch);
+                    // hitmarker X when you connect
+                    if (shotFx>0 && shotHit) {
+                        DrawLine(W/2-14,H/2-14,W/2-6,H/2-6,(Color){220,40,40,255});
+                        DrawLine(W/2+14,H/2-14,W/2+6,H/2-6,(Color){220,40,40,255});
+                        DrawLine(W/2-14,H/2+14,W/2-6,H/2+6,(Color){220,40,40,255});
+                        DrawLine(W/2+14,H/2+14,W/2+6,H/2+6,(Color){220,40,40,255});
+                    }
+                    // muzzle flash bottom-center
+                    if (shotFx>0) {
+                        float a = shotFx*1500; if (a>255) a=255;
+                        DrawCircle(W/2, H-120, 8+shotFx*40, (Color){255,210,80,(unsigned char)a});
+                    }
                 }
 
                 // health bar
