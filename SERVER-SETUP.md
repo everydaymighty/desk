@@ -1,59 +1,31 @@
-# Running the lobby server on your PC (free)
+# Hosting the server (one port, one tunnel)
 
-This is the backbone that lets the 10 computers see each other. It runs on your
-machine. While it's running and reachable, people are connected; when you close
-it, the lobby goes offline.
+Accounts/login are now MERGED into the lobby server, so EVERYTHING runs on a
+single port (8080) and needs only ONE ngrok tunnel. This removes the old
+two-tunnel (8090) headache.
 
-## Step 1 — Install Node.js (one time)
-Download the LTS installer from https://nodejs.org and install it (defaults are
-fine). Check it works — in PowerShell:
+## Run order (on the HOST PC — that's you)
 ```
-node --version
+node servers/server.js          # lobby + chat + friends + game + ACCOUNTS (8080)
+node servers/voice-server.js    # voice relay (UDP 8081, LAN only)
 ```
-You should see something like `v20.x.x`.
+(You can ignore servers/auth-server.js now — login lives in server.js.)
 
-## Step 2 — Start the server
+## Expose to friends over the internet
 ```
-cd C:\Users\illum\Desktop\Projects\desk
-node server.js
+ngrok http 8080
 ```
-You should see:
-```
-Lobby server listening on port 8080
-```
-Leave this window OPEN. Closing it stops the lobby.
+Copy the https URL it prints, e.g. https://abcd1234.ngrok-free.app
 
-## Step 3 — Test on your own machine first
-Your own PC reaches the server at `ws://localhost:8080`. Once the app's
-networking is wired in (next coding step), running the app on this same PC
-should show your username in the online list.
+## What each computer's config needs (next to black.exe)
+- desk_server.txt  -> your 8080 ngrok URL
+- desk_auth.txt    -> the SAME 8080 ngrok URL (login is on the lobby server now)
+- desk_voice.txt   -> 127.0.0.1 (voice is LAN-only; leave as is)
 
-## Step 4 — Let OTHER computers connect (the tunnel)
-Other people can't reach `localhost`. You expose your server to the internet
-with a free tunnel. Easiest is **ngrok**:
-
-1. Make a free account at https://ngrok.com and install ngrok.
-2. Run:
-   ```
-   ngrok http 8080
-   ```
-3. It prints a public address like:
-   ```
-   Forwarding  https://abc123.ngrok-free.app -> http://localhost:8080
-   ```
-4. The WebSocket address others use is that host with `wss://`, e.g.
-   `wss://abc123.ngrok-free.app`. You give this address to the app (we'll add a
-   field for it) so the other 9 computers connect through the tunnel to your PC.
-
-### Important free-tier facts (firm)
-- The ngrok address **changes every time you restart ngrok** (on the free plan).
-  Each new session = new address you have to re-share. A fixed address costs money.
-- The lobby is only online while BOTH `node server.js` AND `ngrok` are running on
-  your PC, and your PC is on and online.
-- This is fine for testing with friends. For an always-on lobby you'd eventually
-  move the server to a free always-on host (Oracle/Fly.io). Same server.js works there.
-
-## What this server does (and doesn't) yet
-- DOES: tracks who is connected and broadcasts the online list.
-- NOT YET: accounts/passwords, friend lists, hosting rooms together. Those build
-  on top of this once presence works.
+## Firm rules
+- Your PC + `node servers/server.js` + `ngrok http 8080` must ALL stay running,
+  and your PC must not sleep, or friends get stuck on "connecting...".
+- The ngrok URL CHANGES every time you restart ngrok. If it changes, update
+  desk_server.txt and desk_auth.txt (both to the new URL) and resend, or just
+  send friends the new URL to paste.
+- Everyone must run the SAME build of black.exe (old builds won't talk to new).

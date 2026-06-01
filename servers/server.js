@@ -16,9 +16,17 @@
 const http = require("http");
 const url = require("url");
 const fs = require("fs");
+const crypto = require("crypto");
 
 const PORT = 8080;
 const TIMEOUT_MS = 6000;       // drop users we haven't heard from in this long
+
+// ---- Accounts (merged in so everything runs on ONE port / one ngrok tunnel) ----
+const USERS_FILE = "users.json";
+let users = {};
+try { users = JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch (e) { users = {}; }
+function saveUsers() { try { fs.writeFileSync(USERS_FILE, JSON.stringify(users)); } catch (e) {} }
+function hashPw(pw, salt) { return crypto.scryptSync(pw, salt, 32).toString("hex"); }
 
 const seen = new Map();        // name -> last heartbeat timestamp (ms)
 const chat = [];               // recent chat lines: "name: message"
@@ -87,6 +95,32 @@ const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
   const path = parsed.pathname;
   res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // ---- Account: register (query params, returns OK or ERR <reason>) ----
+  if (path === "/register") {
+    const name = (parsed.query.name || "").toString().slice(0,24).trim();
+    const pw   = (parsed.query.pw   || "").toString();
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    if (!name || pw.length < 6) { res.end("ERR password must be 6+ chars\n"); return; }
+    if (users[name]) { res.end("ERR username taken\n"); return; }
+    const salt = crypto.randomBytes(16).toString("hex");
+    users[name] = { salt, hash: hashPw(pw, salt) };
+    saveUsers();
+    console.log("registered:", name);
+    res.end("OK\n");
+    return;
+  }
+  // ---- Account: login ----
+  if (path === "/login") {
+    const name = (parsed.query.name || "").toString().slice(0,24).trim();
+    const pw   = (parsed.query.pw   || "").toString();
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    const u = users[name];
+    if (!u || hashPw(pw, u.salt) !== u.hash) { res.end("ERR wrong username or password\n"); return; }
+    console.log("login:", name);
+    res.end("OK\n");
+    return;
+  }
 
   if (path === "/hello") {
     const name = (parsed.query.name || "").toString().slice(0, 24).trim();

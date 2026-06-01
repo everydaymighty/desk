@@ -84,17 +84,17 @@ static void worker_body(void){
         // send my state (blocking is fine — we're off the render thread)
         char st[160];
         snprintf(st,sizeof(st),"%.2f|%.2f|%.2f|%.3f|%.3f|%d|%d",x,y,z,yaw,pitch,hp,score);
-        snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\"\"%s/gset?name=%s&st=%s\"", g_url,g_myname,st);
+        snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\" \"%s/gset?name=%s&st=%s\"", g_url,g_myname,st);
         run_capture(cmd,out,sizeof(out));
 
         // send a hit if queued
         if (ht[0] && hd>0) {
-            snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\"\"%s/ghit?target=%s&dmg=%d\"", g_url,ht,hd);
+            snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\" \"%s/ghit?target=%s&dmg=%d\"", g_url,ht,hd);
             run_capture(cmd,out,sizeof(out));
         }
 
         // fetch all states
-        snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\"\"%s/gget\"", g_url);
+        snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\" \"%s/gget\"", g_url);
         if (run_capture(cmd,out,sizeof(out))) {
             LOCK();
             char *line=strtok(out,"\n");
@@ -118,7 +118,7 @@ static void worker_body(void){
         }
 
         // fetch damage owed to me
-        snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\"\"%s/gdmg?name=%s\"", g_url,g_myname);
+        snprintf(cmd,sizeof(cmd),"curl -s -m 3 -H \"ngrok-skip-browser-warning: 1\" \"%s/gdmg?name=%s\"", g_url,g_myname);
         if (run_capture(cmd,out,sizeof(out))) {
             int d=atoi(out);
             if(d>0){ LOCK(); g_pendingDamage+=d; UNLOCK(); }
