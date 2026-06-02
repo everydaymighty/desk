@@ -19,13 +19,13 @@ Copy the https URL it prints, e.g. https://abcd1234.ngrok-free.app
 
 ## What each computer's config needs (next to black.exe)
 - desk_server.txt  -> your 8080 ngrok URL
-- desk_auth.txt    -> the SAME 8080 ngrok URL (login is on the lobby server now)
 - desk_voice.txt   -> 127.0.0.1 (voice is LAN-only; leave as is)
+  (desk_auth.txt is no longer read — login is on the lobby server.)
 
 ## Firm rules
 - Your PC + `node servers/server.js` + `ngrok http 8080` must ALL stay running,
   and your PC must not sleep, or friends get stuck on "connecting...".
 - The ngrok URL CHANGES every time you restart ngrok. If it changes, update
-  desk_server.txt and desk_auth.txt (both to the new URL) and resend, or just
-  send friends the new URL to paste.
+  desk_server.txt (to the new URL) and resend, or just send friends the new URL
+  to paste.
 - Everyone must run the SAME build of black.exe (old builds won't talk to new).

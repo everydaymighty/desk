@@ -27,6 +27,15 @@ let users = {};
 try { users = JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch (e) { users = {}; }
 function saveUsers() { try { fs.writeFileSync(USERS_FILE, JSON.stringify(users)); } catch (e) {} }
 function hashPw(pw, salt) { return crypto.scryptSync(pw, salt, 32).toString("hex"); }
+// Names must be safe to embed in URLs/leaderboards: letters, digits, _ and -.
+function validName(n) { return /^[A-Za-z0-9_-]{1,24}$/.test(n); }
+// Read a urlencoded POST body (used for auth so the password stays out of the URL).
+function readBody(req, cb) {
+  let data = "";
+  req.on("data", chunk => { data += chunk; if (data.length > 4096) req.destroy(); });
+  req.on("end", () => cb(new URLSearchParams(data)));
+  req.on("error", () => cb(new URLSearchParams("")));
+}
 
 const seen = new Map();        // name -> last heartbeat timestamp (ms)
 const chat = [];               // recent chat lines: "name: message"
@@ -57,8 +66,10 @@ let match = {
   players: [null, null],       // { name, last } per slot
   scores:  [0, 0],             // rounds won
   round:   1,                  // 1..3
-  winner:  null                // name of match winner, or null
+  winner:  null,               // name of match winner, or null
+  lastScoreAt: 0               // ms timestamp of last accepted /score (dedup window)
 };
+const SCORE_DEDUP_MS = 2000;   // ignore repeat /score reports within this window
 
 function pruneMatch() {
   const now = Date.now();
@@ -70,7 +81,7 @@ function pruneMatch() {
   if (match.winner === null && (!match.players[0] || !match.players[1])
       && (match.scores[0] || match.scores[1])) {
     if (!match.players[0] && !match.players[1]) {
-      match.scores = [0,0]; match.round = 1; match.winner = null;
+      match.scores = [0,0]; match.round = 1; match.winner = null; match.lastScoreAt = 0;
     }
   }
 }
@@ -96,29 +107,31 @@ const server = http.createServer((req, res) => {
   const path = parsed.pathname;
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // ---- Account: register (query params, returns OK or ERR <reason>) ----
-  if (path === "/register") {
-    const name = (parsed.query.name || "").toString().slice(0,24).trim();
-    const pw   = (parsed.query.pw   || "").toString();
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    if (!name || pw.length < 6) { res.end("ERR password must be 6+ chars\n"); return; }
-    if (users[name]) { res.end("ERR username taken\n"); return; }
-    const salt = crypto.randomBytes(16).toString("hex");
-    users[name] = { salt, hash: hashPw(pw, salt) };
-    saveUsers();
-    console.log("registered:", name);
-    res.end("OK\n");
-    return;
-  }
-  // ---- Account: login ----
-  if (path === "/login") {
-    const name = (parsed.query.name || "").toString().slice(0,24).trim();
-    const pw   = (parsed.query.pw   || "").toString();
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    const u = users[name];
-    if (!u || hashPw(pw, u.salt) !== u.hash) { res.end("ERR wrong username or password\n"); return; }
-    console.log("login:", name);
-    res.end("OK\n");
+  // ---- Account: register / login ----
+  // Password comes in the POST body (never the URL). Name may be in the query
+  // (it is not secret) or the body. Returns OK or ERR <reason>.
+  if (path === "/register" || path === "/login") {
+    readBody(req, (body) => {
+      const name = (body.get("name") || parsed.query.name || "").toString().slice(0,24).trim();
+      const pw   = (body.get("pw")   || "").toString();
+      res.writeHead(200, { "Content-Type": "text/plain" });
+
+      if (path === "/register") {
+        if (!validName(name)) { res.end("ERR name: letters, digits, _ or - (max 24)\n"); return; }
+        if (pw.length < 6)    { res.end("ERR password must be 6+ chars\n"); return; }
+        if (users[name])      { res.end("ERR username taken\n"); return; }
+        const salt = crypto.randomBytes(16).toString("hex");
+        users[name] = { salt, hash: hashPw(pw, salt) };
+        saveUsers();
+        console.log("registered:", name);
+        res.end("OK\n");
+      } else { // /login
+        const u = users[name];
+        if (!u || hashPw(pw, u.salt) !== u.hash) { res.end("ERR wrong username or password\n"); return; }
+        console.log("login:", name);
+        res.end("OK\n");
+      }
+    });
     return;
   }
 
@@ -188,8 +201,15 @@ const server = http.createServer((req, res) => {
     pruneMatch();
     const name = (parsed.query.name || "").toString().slice(0,24).trim();
     const slot = playerSlot(name);
+    const now = Date.now();
     res.writeHead(200, { "Content-Type": "text/plain" });
+    // Must be an active player and the match not already won. Reject reports that
+    // arrive within SCORE_DEDUP_MS of the last accepted one: a single death often
+    // gets reported by both clients almost simultaneously, and rounds always last
+    // far longer than this window, so legitimate next-round scores still pass.
     if (slot < 0 || match.winner) { res.end("ERR\n"); return; }
+    if (now - match.lastScoreAt < SCORE_DEDUP_MS) { res.end("ERR duplicate\n"); return; }
+    match.lastScoreAt = now;
     match.scores[slot]++;
     if (match.scores[slot] >= 2) {
       match.winner = name;                                 // best of 3
@@ -214,7 +234,7 @@ const server = http.createServer((req, res) => {
 
   // ---- Game: reset the match ----
   if (path === "/resetmatch") {
-    match.scores = [0,0]; match.round = 1; match.winner = null;
+    match.scores = [0,0]; match.round = 1; match.winner = null; match.lastScoreAt = 0;
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("OK\n");
     return;

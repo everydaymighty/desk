@@ -18,3 +18,7 @@ desk_auth_body.tmp
 auth-secret.key
 auth-users.json
 users.json
+
+# server-side player data (regenerated; not meant for the repo)
+friends.json
+leaderboard.json

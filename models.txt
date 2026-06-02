@@ -1,0 +1,10 @@
+# 3D models to load into the intro hallway.
+# One per line:  path  x  y  z  scale
+# - path: an .obj, .glb, or .gltf file in this folder (or full path)
+# - x y z: where to place it (hallway runs along z; door is near z=-1, far end z=36)
+# - scale: size multiplier (1 = original)
+#
+# Lines starting with # are ignored. Example (uncomment + add a real file):
+#
+# barrel.obj      1.5 0 20  1.0
+# statue.glb     -1.5 0 12  0.5

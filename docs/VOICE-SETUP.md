@@ -18,15 +18,14 @@ gcc main.c voice.c -o black.exe -lraylib -lopengl32 -lgdi32 -lwinmm -lws2_32 -lo
 
 ## Build (macOS)
 ```
-cc main.c voice.c -o black $(pkg-config --cflags --libs raylib) \
+cc main.c voice.c game.c -o black $(pkg-config --cflags --libs raylib) \
   -framework Cocoa -framework IOKit -framework OpenGL \
   -framework CoreAudio -framework AudioToolbox
 ```
 
 ## Run order
 ```
-node ../servers/auth-server.js    # accounts (8090)
-node ../servers/server.js         # presence + chat (8080)
+node ../servers/server.js         # lobby + chat + friends + game + accounts (8080)
 node ../servers/voice-server.js   # voice relay (UDP 8081)
 ./black.exe
 ```

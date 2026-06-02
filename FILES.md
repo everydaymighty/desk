@@ -19,7 +19,7 @@
 
 ## Config (must sit next to black.exe — read by filename at startup)
 - `desk_server.txt` — server address (localhost, or your ngrok URL)
-- `desk_auth.txt`   — login address (same as server now)
+- `desk_auth.txt`   — UNUSED (login is on the lobby server; file is ignored)
 - `desk_voice.txt`  — voice server address (127.0.0.1 = LAN)
 
 ## Built app (what actually runs)

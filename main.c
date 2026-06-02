@@ -10,6 +10,15 @@
 // Networking is NOT wired up yet — the lobby is a local mockup. The server and
 // connection come next.
 
+// ---- Prefer the dedicated GPU on dual-graphics laptops ----
+// These exported symbols tell NVIDIA Optimus / AMD switchable graphics to run
+// this app on the high-performance discrete GPU. No windows.h needed — just the
+// exported globals, which the driver reads from the executable.
+#if defined(_WIN32)
+  __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+  __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#endif
+
 #include "raylib.h"
 #include "rlgl.h"      // rlPushMatrix / rlRotatef for the 3D background
 #include <stdio.h>
@@ -59,14 +68,21 @@ static int TxtW(const char *t, int size) {
     return MeasureText(t, size);
 }
 
-// A flat, minimal, hover-aware button. No drop shadow, slight rounding, a thin
-// border that brightens on hover — a more restrained, mature look.
+// ---- Accent palette (from the user's swatches) ----
+#define ACC_BLUE   (Color){ 110, 140, 190, 255 }   // muted blue
+#define ACC_OLIVE  (Color){ 120, 130,  80, 255 }   // olive/khaki
+#define ACC_MAROON (Color){ 150,  80,  80, 255 }   // dusty maroon
+#define ACC_GREEN  (Color){ 110, 140, 100, 255 }   // sage green
+#define ACC_PURPLE (Color){ 150, 130, 175, 255 }   // muted lavender
+#define ACC_TAN    (Color){ 190, 170, 135, 255 }   // tan
+
+// A flat, sharp-edged, hover-aware button (squared corners for a cleaner look).
 static bool Button(Rectangle r, const char *label, int fontSize,
                    Color base, Color hover, Color textCol, Vector2 mouse) {
     bool over = CheckCollisionPointRec(mouse, r);
     Color c = over ? hover : base;
-    DrawRectangleRounded(r, 0.16f, 6, c);
-    DrawRectangleRoundedLines(r, 0.16f, 6, over ? (Color){120,125,140,200} : (Color){70,72,84,160});
+    DrawRectangleRounded(r, 0.04f, 4, c);
+    DrawRectangleRoundedLines(r, 0.04f, 4, over ? (Color){130,135,150,220} : (Color){70,72,84,160});
     int tw = TxtW(label, fontSize);
     Txt(label, (int)(r.x + r.width/2 - tw/2), (int)(r.y + r.height/2 - fontSize/2), fontSize, textCol);
     return over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
@@ -74,12 +90,13 @@ static bool Button(Rectangle r, const char *label, int fontSize,
 
 // Horizontal slider 0..maxVal. Drag or click the track to set. Returns value.
 static int Slider(Rectangle r, int value, int maxVal, Vector2 mouse) {
-    DrawRectangleRounded((Rectangle){r.x, r.y + r.height/2 - 3, r.width, 6}, 1.0f, 4, (Color){55,57,68,255});
+    DrawRectangle((int)r.x, (int)(r.y + r.height/2 - 2), (int)r.width, 4, (Color){55,57,68,255});
     float frac = (float)value / (float)maxVal;
     float kx = r.x + frac * r.width;
-    // filled portion
-    DrawRectangleRounded((Rectangle){r.x, r.y + r.height/2 - 3, kx - r.x, 6}, 1.0f, 4, (Color){90,120,170,255});
-    DrawCircle((int)kx, (int)(r.y + r.height/2), 8, (Color){150,170,210,255});
+    // filled portion (accent blue)
+    DrawRectangle((int)r.x, (int)(r.y + r.height/2 - 2), (int)(kx - r.x), 4, ACC_BLUE);
+    // square knob
+    DrawRectangle((int)kx-5, (int)(r.y + r.height/2)-7, 10, 14, (Color){175,190,215,255});
     if (CheckCollisionPointRec(mouse, (Rectangle){r.x-8, r.y-6, r.width+16, r.height+12})
         && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         float f = (mouse.x - r.x) / r.width;
@@ -94,7 +111,161 @@ static int Slider(Rectangle r, int value, int maxVal, Vector2 mouse) {
 #define GH_OWNER    "everydaymighty"
 #define GH_REPO     "desk"
 
-typedef enum { SCREEN_USERNAME, SCREEN_DESKTOP, SCREEN_LOBBY, SCREEN_GAME } Screen;
+typedef enum { SCREEN_INTRO, SCREEN_FLASH, SCREEN_USERNAME, SCREEN_DESKTOP, SCREEN_LOBBY, SCREEN_GAME } Screen;
+
+// ---- Level editor: placeable primitive entities ----
+typedef enum { PROP_BOX, PROP_CYLINDER, PROP_SPHERE, PROP_PEDESTAL, PROP_WALL, PROP_RAMP, PROP_TYPE_COUNT } PropType;
+static const char *PROP_NAMES[PROP_TYPE_COUNT] = { "Box", "Cylinder", "Sphere", "Pedestal", "Wall", "Ramp" };
+typedef struct {
+    PropType type;
+    Vector3  pos;
+    Vector3  size;   // w,h,d (radius uses x)
+    float    rotY;   // yaw degrees
+    Color    color;
+    int      texId;  // index into g_texLib, or -1 for none (flat color)
+} Prop;
+#define MAX_PROPS 256
+static Prop  g_props[MAX_PROPS];
+static int   g_propCount = 0;
+
+// ---- Texture library: imported images you can assign to props ----
+#define MAX_TEX 32
+static Texture2D g_texLib[MAX_TEX];
+static char      g_texName[MAX_TEX][64];
+static int       g_texCount = 0;
+// Scan the textures/ folder for images and load them into the library.
+static void LoadTextureLibrary(void) {
+    g_texCount = 0;
+    FilePathList files = LoadDirectoryFilesEx("textures", ".png;.jpg;.jpeg;.bmp", false);
+    for (unsigned int i=0; i<files.count && g_texCount<MAX_TEX; i++) {
+        Texture2D t = LoadTexture(files.paths[i]);
+        if (t.id != 0) {
+            SetTextureWrap(t, TEXTURE_WRAP_REPEAT);
+            g_texLib[g_texCount] = t;
+            const char *nm = GetFileName(files.paths[i]);
+            strncpy(g_texName[g_texCount], nm, 63); g_texName[g_texCount][63]='\0';
+            g_texCount++;
+        }
+    }
+    UnloadDirectoryFiles(files);
+}
+
+// Palette of colors to cycle when placing.
+static Color PROP_PALETTE[8] = {
+    {200,200,206,255},{120,150,190,255},{190,150,110,255},{150,170,130,255},
+    {200,120,120,255},{170,140,190,255},{210,200,150,255},{90,95,110,255}
+};
+
+static void SaveMap(void) {
+    FILE *f = fopen("map.txt","w");
+    if (!f) return;
+    fprintf(f, "# desk map: type x y z sx sy sz rotY r g b texId\n");
+    for (int i=0;i<g_propCount;i++) {
+        Prop *p=&g_props[i];
+        fprintf(f, "%d %.2f %.2f %.2f %.2f %.2f %.2f %.1f %d %d %d %d\n",
+            p->type, p->pos.x,p->pos.y,p->pos.z, p->size.x,p->size.y,p->size.z,
+            p->rotY, p->color.r,p->color.g,p->color.b, p->texId);
+    }
+    fclose(f);
+}
+static void LoadMap(void) {
+    FILE *f = fopen("map.txt","r");
+    if (!f) return;
+    g_propCount = 0;
+    char line[256];
+    while (g_propCount<MAX_PROPS && fgets(line,sizeof(line),f)) {
+        if (line[0]=='#'||line[0]=='\n') continue;
+        Prop p; int t,r,g,b,tex=-1;
+        int got = sscanf(line,"%d %f %f %f %f %f %f %f %d %d %d %d",
+            &t,&p.pos.x,&p.pos.y,&p.pos.z,&p.size.x,&p.size.y,&p.size.z,&p.rotY,&r,&g,&b,&tex);
+        if (got>=11) {
+            p.type=(PropType)t; p.color=(Color){(unsigned char)r,(unsigned char)g,(unsigned char)b,255};
+            p.texId = (got>=12) ? tex : -1;
+            g_props[g_propCount++]=p;
+        }
+    }
+    fclose(f);
+}
+// Textured cube (uses the assigned texture on all faces). Falls back handled by caller.
+static void DrawCubeTex(Texture2D tex, Vector3 size, Color tint) {
+    float x=size.x/2, y=size.y/2, z=size.z/2;
+    rlSetTexture(tex.id);
+    rlBegin(RL_QUADS);
+    rlColor4ub(tint.r,tint.g,tint.b,tint.a);
+    // front
+    rlNormal3f(0,0,1);
+    rlTexCoord2f(0,0);rlVertex3f(-x,-y,z); rlTexCoord2f(1,0);rlVertex3f(x,-y,z);
+    rlTexCoord2f(1,1);rlVertex3f(x,y,z);   rlTexCoord2f(0,1);rlVertex3f(-x,y,z);
+    // back
+    rlNormal3f(0,0,-1);
+    rlTexCoord2f(1,0);rlVertex3f(-x,-y,-z); rlTexCoord2f(1,1);rlVertex3f(-x,y,-z);
+    rlTexCoord2f(0,1);rlVertex3f(x,y,-z);   rlTexCoord2f(0,0);rlVertex3f(x,-y,-z);
+    // top
+    rlNormal3f(0,1,0);
+    rlTexCoord2f(0,1);rlVertex3f(-x,y,-z); rlTexCoord2f(0,0);rlVertex3f(-x,y,z);
+    rlTexCoord2f(1,0);rlVertex3f(x,y,z);   rlTexCoord2f(1,1);rlVertex3f(x,y,-z);
+    // bottom
+    rlNormal3f(0,-1,0);
+    rlTexCoord2f(1,1);rlVertex3f(-x,-y,-z); rlTexCoord2f(0,1);rlVertex3f(x,-y,-z);
+    rlTexCoord2f(0,0);rlVertex3f(x,-y,z);   rlTexCoord2f(1,0);rlVertex3f(-x,-y,z);
+    // right
+    rlNormal3f(1,0,0);
+    rlTexCoord2f(1,0);rlVertex3f(x,-y,-z); rlTexCoord2f(1,1);rlVertex3f(x,y,-z);
+    rlTexCoord2f(0,1);rlVertex3f(x,y,z);   rlTexCoord2f(0,0);rlVertex3f(x,-y,z);
+    // left
+    rlNormal3f(-1,0,0);
+    rlTexCoord2f(0,0);rlVertex3f(-x,-y,-z); rlTexCoord2f(1,0);rlVertex3f(-x,-y,z);
+    rlTexCoord2f(1,1);rlVertex3f(-x,y,z);   rlTexCoord2f(0,1);rlVertex3f(-x,y,-z);
+    rlEnd();
+    rlSetTexture(0);
+}
+
+static void DrawProp(Prop *p, Color override, bool useOverride) {
+    Color c = useOverride ? override : p->color;
+    int hasTex = (!useOverride && p->texId>=0 && p->texId<g_texCount);
+    rlPushMatrix();
+    rlTranslatef(p->pos.x, p->pos.y, p->pos.z);
+    rlRotatef(p->rotY, 0,1,0);
+    switch (p->type) {
+        case PROP_BOX: case PROP_WALL: case PROP_PEDESTAL: case PROP_RAMP:
+            if (hasTex) DrawCubeTex(g_texLib[p->texId], p->size, WHITE);
+            else { DrawCube((Vector3){0,0,0}, p->size.x,p->size.y,p->size.z, c);
+                   DrawCubeWires((Vector3){0,0,0}, p->size.x,p->size.y,p->size.z, Fade(BLACK,0.2f)); }
+            break;
+        case PROP_CYLINDER: DrawCylinder((Vector3){0,-p->size.y/2,0}, p->size.x,p->size.x,p->size.y,16,c); break;
+        case PROP_SPHERE:   DrawSphere((Vector3){0,0,0}, p->size.x, c); break;
+        default: break;
+    }
+    rlPopMatrix();
+}
+// Draw a textured quad (for floor/walls). Center c, with half-extents along two
+// axes given by 'right' and 'up' vectors; 'tile' repeats the texture.
+static void DrawTexturedQuad(Texture2D tex, Vector3 c, Vector3 right, Vector3 up, float tile) {
+    rlSetTexture(tex.id);
+    rlBegin(RL_QUADS);
+    rlColor4ub(255,255,255,255);
+    Vector3 p0={c.x-right.x-up.x, c.y-right.y-up.y, c.z-right.z-up.z};
+    Vector3 p1={c.x+right.x-up.x, c.y+right.y-up.y, c.z+right.z-up.z};
+    Vector3 p2={c.x+right.x+up.x, c.y+right.y+up.y, c.z+right.z+up.z};
+    Vector3 p3={c.x-right.x+up.x, c.y-right.y+up.y, c.z-right.z+up.z};
+    rlTexCoord2f(0,0);     rlVertex3f(p0.x,p0.y,p0.z);
+    rlTexCoord2f(tile,0);  rlVertex3f(p1.x,p1.y,p1.z);
+    rlTexCoord2f(tile,tile);rlVertex3f(p2.x,p2.y,p2.z);
+    rlTexCoord2f(0,tile);  rlVertex3f(p3.x,p3.y,p3.z);
+    rlEnd();
+    rlSetTexture(0);
+}
+
+static Vector3 DefaultSize(PropType t) {
+    switch(t){
+        case PROP_CYLINDER: return (Vector3){0.5f,2.0f,0.5f};
+        case PROP_SPHERE:   return (Vector3){0.6f,0.6f,0.6f};
+        case PROP_PEDESTAL: return (Vector3){1.4f,1.2f,1.4f};
+        case PROP_WALL:     return (Vector3){4.0f,3.0f,0.3f};
+        case PROP_RAMP:     return (Vector3){2.0f,0.3f,3.0f};
+        default:            return (Vector3){1.0f,1.0f,1.0f};
+    }
+}
 
 static char g_updateMsg[256] = "";
 
@@ -106,14 +277,14 @@ static char g_username[32] = "";
 // Server base URL is read from desk_server.txt (e.g. http://localhost:8080
 // for local testing, or your ngrok https URL for other computers). If the file
 // is missing we default to localhost.
+// NOTE: auth was merged into the main lobby server (g_serverURL, port 8080), so
+// there is no separate auth URL anymore. desk_auth.txt is no longer read.
 #define SERVER_FILE "desk_server.txt"
-#define AUTH_FILE   "desk_auth.txt"     // auth server URL (default localhost:8090)
 #define ONLINE_FILE "desk_online.txt"
 #define CHAT_FILE   "desk_chat.txt"
 #define FRIENDS_FILE "desk_friends.txt"
 static char g_serverURL[256] = "http://localhost:8080";
-static char g_authURL[256]   = "http://localhost:8090";
-static char g_token[512]     = "";   // session token from the auth server
+static char g_token[512]     = "";   // reserved for a future session token
 static char g_online[2048]   = "";   // raw newline-separated names from server
 static char g_chat[4096]     = "";   // raw newline-separated chat lines from server
 static char g_friends[2048]  = "";   // raw newline-separated friend names
@@ -123,20 +294,9 @@ static char g_gamestate[512] = "";   // raw JSON match state from server
 static char g_leaderboard[1024] = "";// raw "name W-L" lines
 static int  g_myRole = -1;           // -1 unknown, 0/1 = player slot, 2 = spectator
 
-// Forward declaration (defined later, used by GameJoin above its definition).
+// Forward declarations (defined later, used above their definitions).
 static int RunCapture(const char *cmd, char *out, size_t outSize);
-
-static void LoadAuthURL(void)
-{
-    FILE *fp = fopen(AUTH_FILE, "r");
-    if (!fp) return;
-    if (fgets(g_authURL, sizeof(g_authURL), fp)) {
-        size_t n = strlen(g_authURL);
-        while (n > 0 && (g_authURL[n-1]=='\n'||g_authURL[n-1]=='\r'||g_authURL[n-1]==' '||g_authURL[n-1]=='/'))
-            g_authURL[--n] = '\0';
-    }
-    fclose(fp);
-}
+static void UrlEncode(const char *in, char *out, size_t outSize);
 
 static void LoadServerURL(void)
 {
@@ -155,10 +315,11 @@ static void LoadServerURL(void)
 static void PollLobby(void)
 {
     char cmd[1024];
+    char un[128]; UrlEncode(g_username, un, sizeof(un));   // never inject names
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
         "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/hello?name=%s\" >NUL 2>&1",
-        g_serverURL, g_username);
+        g_serverURL, un);
     system(cmd);
     snprintf(cmd, sizeof(cmd),
         "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/online\" 2>NUL",
@@ -170,7 +331,7 @@ static void PollLobby(void)
     system(cmd);
     snprintf(cmd, sizeof(cmd),
         "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/friends?name=%s\" 2>NUL",
-        FRIENDS_FILE, g_serverURL, g_username);
+        FRIENDS_FILE, g_serverURL, un);
     system(cmd);
     snprintf(cmd, sizeof(cmd),
         "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/leaderboard\" 2>NUL",
@@ -183,8 +344,8 @@ static void PollLobby(void)
         "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/chat\" 2>/dev/null; "
         "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/friends?name=%s\" 2>/dev/null; "
         "  curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/leaderboard\" 2>/dev/null ) &",
-        g_serverURL, g_username, ONLINE_FILE, g_serverURL, CHAT_FILE, g_serverURL,
-        FRIENDS_FILE, g_serverURL, g_username, LEADERBOARD_FILE, g_serverURL);
+        g_serverURL, un, ONLINE_FILE, g_serverURL, CHAT_FILE, g_serverURL,
+        FRIENDS_FILE, g_serverURL, un, LEADERBOARD_FILE, g_serverURL);
     system(cmd);
 #endif
 }
@@ -222,14 +383,17 @@ static void AddFriend(const char *friendName)
 {
     if (!friendName[0]) return;
     char cmd[1024];
+    char un[128], fn[128];
+    UrlEncode(g_username, un, sizeof(un));
+    UrlEncode(friendName, fn, sizeof(fn));
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
         "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/addfriend?name=%s&friend=%s\" >NUL 2>&1",
-        g_serverURL, g_username, friendName);
+        g_serverURL, un, fn);
 #else
     snprintf(cmd, sizeof(cmd),
         "curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/addfriend?name=%s&friend=%s\" >/dev/null 2>&1 &",
-        g_serverURL, g_username, friendName);
+        g_serverURL, un, fn);
 #endif
     system(cmd);
 }
@@ -243,21 +407,40 @@ static int IsFriend(const char *name)
     return 0;
 }
 
+// Is this exact name present in the online list? Line-exact (not substring) so
+// "Al" doesn't falsely match "Alice".
+static int NameOnline(const char *name)
+{
+    char buf[2048]; strncpy(buf, g_online, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+    char *ln = strtok(buf, "\n");
+    while (ln) { if (strcmp(ln, name) == 0) return 1; ln = strtok(NULL, "\n"); }
+    return 0;
+}
+
 // --- Game matchmaking helpers ---
 // Claim a slot (or spectator). Reads back "PLAYER 0/1" or "SPECTATOR".
 static void GameJoin(void)
 {
     char cmd[1024], out[64];
-    snprintf(cmd, sizeof(cmd), "curl -s -m 5 -H \"ngrok-skip-browser-warning: 1\" \"%s/join?name=%s\"", g_serverURL, g_username);
+    char un[128]; UrlEncode(g_username, un, sizeof(un));
+    snprintf(cmd, sizeof(cmd), "curl -s -m 5 -H \"ngrok-skip-browser-warning: 1\" \"%s/join?name=%s\"", g_serverURL, un);
     if (RunCapture(cmd, out, sizeof(out))) {
         if (strncmp(out, "PLAYER 0", 8) == 0) g_myRole = 0;
         else if (strncmp(out, "PLAYER 1", 8) == 0) g_myRole = 1;
         else if (strncmp(out, "SPECTATOR", 9) == 0) g_myRole = 2;
     }
 }
-// Fetch current match state JSON into g_gamestate (detached, non-blocking).
+// Refresh the match state JSON in g_gamestate. The fetch is detached so it never
+// blocks the render thread; we READ the file FIRST (the result of the previous
+// call's fetch) and THEN kick off the next fetch. This means the state is one
+// poll cycle (~0.5s) behind, which is fine — the old code read the file in the
+// same call it spawned the async write, so it always saw stale/empty data anyway.
 static void GamePoll(void)
 {
+    // 1) consume whatever the last fetch wrote
+    FILE *fp = fopen(GAMESTATE_FILE, "r");
+    if (fp) { size_t n = fread(g_gamestate,1,sizeof(g_gamestate)-1,fp); g_gamestate[n]='\0'; fclose(fp); }
+    // 2) kick off the next fetch (detached)
     char cmd[1024];
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
@@ -267,8 +450,6 @@ static void GamePoll(void)
         "curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" -o \"%s\" \"%s/gamestate\" 2>/dev/null &", GAMESTATE_FILE, g_serverURL);
 #endif
     system(cmd);
-    FILE *fp = fopen(GAMESTATE_FILE, "r");
-    if (fp) { size_t n = fread(g_gamestate,1,sizeof(g_gamestate)-1,fp); g_gamestate[n]='\0'; fclose(fp); }
 }
 // Tiny JSON int extractor for the gamestate.
 static int GsInt(const char *key) {
@@ -308,15 +489,16 @@ static void SendChat(const char *msg)
 {
     if (!msg[0]) return;
     char enc[640]; UrlEncode(msg, enc, sizeof(enc));
+    char un[128];  UrlEncode(g_username, un, sizeof(un));
     char cmd[1024];
 #if defined(_WIN32)
     snprintf(cmd, sizeof(cmd),
         "cmd /c start \"\" /b curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/say?name=%s&msg=%s\" >NUL 2>&1",
-        g_serverURL, g_username, enc);
+        g_serverURL, un, enc);
 #else
     snprintf(cmd, sizeof(cmd),
         "curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/say?name=%s&msg=%s\" >/dev/null 2>&1 &",
-        g_serverURL, g_username, enc);
+        g_serverURL, un, enc);
 #endif
     system(cmd);
 }
@@ -396,19 +578,39 @@ static int JsonIsTrue(const char *json, const char *key)
     return strncmp(p, "true", 4) == 0;
 }
 
-// Call /login or /register on the AUTH server using a POST body so the password
+// Call /login or /register on the lobby server using a POST body so the password
 // never appears in the URL or process args. Writes the password to a temp file
-// and has curl send it, then deletes it. On success, stores the session token.
+// and has curl send it, then deletes it. Returns 1 on success, 0 on failure.
 static int AuthRequest(const char *action, const char *name, const char *pw,
                        char *errOut, size_t errSize)
 {
-    // Auth now lives on the SAME lobby server (g_serverURL, port 8080) as a
-    // simple GET — one server, one ngrok tunnel. Returns "OK" or "ERR <reason>".
+    // Auth lives on the SAME lobby server (g_serverURL, port 8080) — one server,
+    // one ngrok tunnel. The password is POSTed from a temp file via curl's
+    // --data-urlencode pw@FILE, so it never appears in the URL OR in the process
+    // argument list (where `ps` could read it). The file is deleted immediately.
+    char pwPath[512];
+#if defined(_WIN32)
+    const char *tmpdir = getenv("TEMP"); if (!tmpdir) tmpdir = ".";
+    snprintf(pwPath, sizeof(pwPath), "%s\\desk_pw_%lu.tmp", tmpdir, (unsigned long)(GetTime()*1000));
+#else
+    const char *tmpdir = getenv("TMPDIR"); if (!tmpdir) tmpdir = "/tmp";
+    snprintf(pwPath, sizeof(pwPath), "%s/desk_pw_%d.tmp", tmpdir, (int)(GetTime()*1000));
+#endif
+    FILE *pf = fopen(pwPath, "w");
+    if (!pf) { snprintf(errOut, errSize, "Could not write temp file"); return 0; }
+    fputs(pw, pf);   // file holds ONLY the raw password; curl reads it via pw@FILE
+    fclose(pf);
+
+    // 'name' is already restricted to [A-Za-z0-9_-] (safe in the shell and a
+    // no-op under URL-encoding), and curl's --data-urlencode encodes it again, so
+    // we pass it raw rather than pre-encoding (which would double-encode).
     char cmd[1024], out[1024];
     snprintf(cmd, sizeof(cmd),
-        "curl -s -m 8 -H \"ngrok-skip-browser-warning: 1\" \"%s/%s?name=%s&pw=%s\"",
-        g_serverURL, action, name, pw);
+        "curl -s -m 8 -H \"ngrok-skip-browser-warning: 1\" "
+        "--data-urlencode \"name=%s\" --data-urlencode \"pw@%s\" \"%s/%s\"",
+        name, pwPath, g_serverURL, action);
     int ok = RunCapture(cmd, out, sizeof(out));
+    remove(pwPath);   // wipe the password file no matter what
 
     if (!ok || out[0] == '\0') {
         snprintf(errOut, errSize, "No response (is the server running?)");
@@ -426,35 +628,89 @@ static int AuthRequest(const char *action, const char *name, const char *pw,
   #define ASSET_NAME "black"
 #endif
 
-static void DoInAppUpdate(const char *latest)
+// Pull the first run of >=64 hex chars out of arbitrary text (certutil/shasum
+// output, or a .sha256 file), lowercased, into out65. Returns 1 on success.
+static int ExtractSha256(const char *in, char *out65)
+{
+    int run = 0; const char *start = NULL;
+    for (const char *p = in; ; p++) {
+        char c = *p;
+        int isHex = (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');
+        if (isHex) { if (run==0) start = p; if (++run >= 64) break; }
+        else { run = 0; start = NULL; if (c=='\0') break; }
+    }
+    if (run < 64 || !start) { out65[0]='\0'; return 0; }
+    for (int i=0;i<64;i++) { char c=start[i]; out65[i] = (c>='A'&&c<='F') ? (char)(c-'A'+'a') : c; }
+    out65[64]='\0';
+    return 1;
+}
+
+// Download the published SHA-256 for ASSET_NAME and the freshly-downloaded
+// binary's own hash, and compare. Returns 1 only if they match. Fails CLOSED:
+// any download error, missing checksum, or mismatch returns 0 so we never
+// install an unverified or tampered binary.
+static int VerifyDownload(const char *dlBase, const char *localFile)
+{
+    char cmd[2048], out[2048];
+    char expected[65] = "", actual[65] = "";
+
+    // 1) expected hash, published alongside the release as ASSET_NAME.sha256
+    snprintf(cmd, sizeof(cmd),
+        "curl -fsSL -H \"User-Agent: desk\" \"%s%s.sha256\"", dlBase, ASSET_NAME);
+    if (!RunCapture(cmd, out, sizeof(out)) || !ExtractSha256(out, expected)) return 0;
+
+    // 2) actual hash of what we just downloaded
+#if defined(_WIN32)
+    snprintf(cmd, sizeof(cmd), "certutil -hashfile \"%s\" SHA256", localFile);
+#else
+    snprintf(cmd, sizeof(cmd), "shasum -a 256 \"%s\"", localFile);
+#endif
+    if (!RunCapture(cmd, out, sizeof(out)) || !ExtractSha256(out, actual)) return 0;
+
+    return strcmp(expected, actual) == 0;
+}
+
+// Returns 1 if an update was downloaded, verified, and scheduled to install;
+// 0 if anything failed (and nothing was replaced).
+static int DoInAppUpdate(const char *latest)
 {
     const char *dlBase =
         "https://github.com/" GH_OWNER "/" GH_REPO "/releases/latest/download/";
+    char cmd[2048], out[256];
 #if defined(_WIN32)
-    char cmd[2048];
+    const char *newFile = "black.new.exe";
     snprintf(cmd, sizeof(cmd),
         "powershell -NoProfile -Command "
-        "\"Invoke-WebRequest -UseBasicParsing -Uri '%s%s' -OutFile 'black.new.exe'\"",
-        dlBase, ASSET_NAME);
-    char out[256];
+        "\"Invoke-WebRequest -UseBasicParsing -Uri '%s%s' -OutFile '%s'\"",
+        dlBase, ASSET_NAME, newFile);
     RunCapture(cmd, out, sizeof(out));
+    if (!VerifyDownload(dlBase, newFile)) {
+        remove(newFile);
+        snprintf(g_updateMsg, sizeof(g_updateMsg),
+                 "Update aborted: checksum did not verify.");
+        return 0;
+    }
     system("powershell -NoProfile -WindowStyle Hidden -Command "
            "\"Start-Process powershell -WindowStyle Hidden -ArgumentList "
            "'-NoProfile','-Command','Start-Sleep -Seconds 2; "
            "Move-Item -Force black.new.exe black.exe; Start-Process black.exe'\"");
-    snprintf(g_updateMsg, sizeof(g_updateMsg),
-             "Updating to %s... the app will relaunch.", latest);
 #else
-    char cmd[2048];
+    const char *newFile = "black.new";
     snprintf(cmd, sizeof(cmd),
-        "curl -fsSL -H 'User-Agent: desk' -o black.new '%s%s' && chmod +x black.new",
-        dlBase, ASSET_NAME);
-    char out[256];
+        "curl -fsSL -H 'User-Agent: desk' -o %s '%s%s' && chmod +x %s",
+        newFile, dlBase, ASSET_NAME, newFile);
     RunCapture(cmd, out, sizeof(out));
+    if (!VerifyDownload(dlBase, newFile)) {
+        remove(newFile);
+        snprintf(g_updateMsg, sizeof(g_updateMsg),
+                 "Update aborted: checksum did not verify.");
+        return 0;
+    }
     system("( sleep 2; mv -f black.new black; ./black ) >/dev/null 2>&1 &");
+#endif
     snprintf(g_updateMsg, sizeof(g_updateMsg),
              "Updating to %s... the app will relaunch.", latest);
-#endif
+    return 1;
 }
 
 static bool g_quitForUpdate = false;
@@ -485,8 +741,8 @@ static void CheckForUpdate(void)
     if (strcmp(latest, APP_VERSION) == 0) {
         snprintf(g_updateMsg, sizeof(g_updateMsg), "Up to date (%s).", APP_VERSION);
     } else {
-        DoInAppUpdate(latest);
-        g_quitForUpdate = true;
+        // Only relaunch if the new binary downloaded AND its checksum verified.
+        if (DoInAppUpdate(latest)) g_quitForUpdate = true;
     }
 }
 
@@ -494,7 +750,9 @@ int main(void)
 {
     // Open a small window first so we can read the monitor's native resolution,
     // then resize to fill it. The user can change resolution later in Settings.
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);  // 4x antialiasing
+    // 4x MSAA antialiasing + resizable. (High-DPI flag left OFF: it rescales
+    // mouse coordinates and would misalign every button click in the UI.)
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 720, "Desktop");
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);   // don't let ESC close the app; we use it for navigation
@@ -505,20 +763,82 @@ int main(void)
     int nativeW = GetMonitorWidth(mon), nativeH = GetMonitorHeight(mon);
     if (nativeW < 640 || nativeH < 480) { nativeW = 1280; nativeH = 720; } // fallback
     // Preset resolutions to cycle in Settings (last = Native).
-    int resW[5] = { 1280, 1600, 1920, 2560, nativeW };
-    int resH[5] = {  720,  900, 1080, 1440, nativeH };
-    const char *resLabel[5] = { "1280x720", "1600x900", "1920x1080", "2560x1440", "Native" };
+    int resW[6] = { 1280, 1920, 2560, 3840, nativeW, nativeW };
+    int resH[6] = {  720, 1080, 1440, 2160, nativeH, nativeH };
+    const char *resLabel[6] = { "1280x720", "1920x1080", "2560x1440 (2K)", "3840x2160 (4K)", "Native", "Native" };
     int resMode = 4;  // default to Native
+    int resCount = 5; // (6th slot is a duplicate guard; cycle through 5)
     SetWindowSize(nativeW, nativeH);
     SetWindowPosition( (GetMonitorWidth(mon)-nativeW)/2, (GetMonitorHeight(mon)-nativeH)/2 );
 
     // Always start at the login screen. We pre-fill the last username for
     // convenience, but never store the password, so the user logs in each run.
     LoadUsername();
-    LoadAuthURL();
-    Screen screen = SCREEN_USERNAME;
+    Screen screen = SCREEN_INTRO;   // walk through the door first
+
+    // Intro (Doom-style) state — long hallway, door at the far end (-Z)
+    Vector3 introPos = { 0, 1.6f, 34 };   // start way back
+    float introYaw = -1.5708f;             // facing -Z (toward the door)
+    float introPitch = 0;
+    double flashStart = 0;
+
+    // ---- Optional 3D model loading (.obj / .glb / .gltf) ----
+    // Drop a model file in the folder and name it in models.txt (one path per
+    // line, optional "x y z scale" after). If models.txt is missing, none load.
+    #define MAX_MODELS 32
+    Model  loadedModels[MAX_MODELS];
+    Vector3 modelPos[MAX_MODELS];
+    float  modelScale[MAX_MODELS];
+    char   modelPath[MAX_MODELS][200];
+    int    modelCount = 0;
+    {
+        FILE *mf = fopen("models.txt", "r");
+        if (mf) {
+            char line[256];
+            while (modelCount < MAX_MODELS && fgets(line, sizeof(line), mf)) {
+                size_t n = strlen(line);
+                while (n>0 && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]='\0';
+                if (line[0]=='\0' || line[0]=='#') continue;
+                char path[200]; float px=0,py=0,pz=10,sc=1.0f;
+                int got = sscanf(line, "%199s %f %f %f %f", path, &px,&py,&pz,&sc);
+                if (got >= 1 && FileExists(path)) {
+                    loadedModels[modelCount] = LoadModel(path);
+                    strncpy(modelPath[modelCount], path, 199); modelPath[modelCount][199]='\0';
+                    modelPos[modelCount]   = (Vector3){ px, py, pz };
+                    modelScale[modelCount] = (got >= 5) ? sc : 1.0f;
+                    modelCount++;
+                }
+            }
+            fclose(mf);
+        }
+    }
+    // ---- Museum textures (optional: drop these .png files in the folder) ----
+    // floor.png, wall.png, ceiling.png, art1.png, art2.png. Missing ones just
+    // fall back to flat colors, so it never breaks.
+    Texture2D texFloor={0}, texWall={0}, texCeil={0}, texArt1={0}, texArt2={0};
+    bool hasFloor=false, hasWall=false, hasCeil=false, hasArt1=false, hasArt2=false;
+    if (FileExists("floor.png"))   { texFloor=LoadTexture("floor.png");   hasFloor=(texFloor.id!=0); }
+    if (FileExists("wall.png"))    { texWall =LoadTexture("wall.png");    hasWall =(texWall.id!=0); }
+    if (FileExists("ceiling.png")) { texCeil =LoadTexture("ceiling.png"); hasCeil =(texCeil.id!=0); }
+    if (FileExists("art1.png"))    { texArt1 =LoadTexture("art1.png");    hasArt1 =(texArt1.id!=0); }
+    if (FileExists("art2.png"))    { texArt2 =LoadTexture("art2.png");    hasArt2 =(texArt2.id!=0); }
+    // make textures tile/repeat where used
+    if (hasFloor) SetTextureWrap(texFloor, TEXTURE_WRAP_REPEAT);
+    if (hasWall)  SetTextureWrap(texWall,  TEXTURE_WRAP_REPEAT);
+
+    // ---- Editor state ----
+    bool editMode = false;
+    int  editSel = -1;        // selected loaded-model index (legacy), -1 = none
+    LoadTextureLibrary();     // scan textures/ folder for imported images
+    LoadMap();                // load placed props from map.txt
+    int  texSel = -1;         // texture-library index chosen in the editor panel
+    int  propSel = -1;        // selected prop index
+    int  paletteType = 0;     // currently chosen prop type to spawn
+    int  paletteColor = 0;    // currently chosen color index
+    bool gridSnap = true;     // snap placement to 0.5 grid
     LoadServerURL();
     double nextPoll = 0.0;   // poll the lobby server on a timer
+    double nextGamePoll = 0.0; // poll /gamestate while in a match
 
     bool voiceOK = voice_init(g_username);   // mic + speaker + UDP socket (tagged with our name)
     game_init(g_username);                    // 1v1 arena networking
@@ -597,7 +917,314 @@ int main(void)
         int W = GetScreenWidth(), H = GetScreenHeight();
         Vector2 m = GetMousePosition();
 
-        if (screen == SCREEN_USERNAME)
+        if (screen == SCREEN_INTRO)
+        {
+            float dt = GetFrameTime();
+            static bool introCursorInit = false;
+            if (!introCursorInit) { if (!editMode) DisableCursor(); introCursorInit = true; }
+
+            // E toggles the level editor (god-mode free-fly)
+            if (IsKeyPressed(KEY_E)) {
+                editMode = !editMode; editSel = -1;
+                if (editMode) EnableCursor();   // editor: free cursor for clicking
+                else          DisableCursor();  // walk: locked mouse-look
+            }
+
+            if (!editMode) {
+                // ---- WALK mode: mouse-look, floor-locked, bounded hallway ----
+                Vector2 md = GetMouseDelta();
+                introYaw += md.x * 0.003f;
+                introPitch -= md.y * 0.003f;
+                if (introPitch >  1.4f) introPitch = 1.4f;
+                if (introPitch < -1.4f) introPitch = -1.4f;
+
+                float spd = 4.0f * dt;
+                Vector3 fwd = { cosf(introYaw), 0, sinf(introYaw) };
+                Vector3 rgt = { -sinf(introYaw), 0, cosf(introYaw) };
+                if (IsKeyDown(KEY_W)) { introPos.x += fwd.x*spd; introPos.z += fwd.z*spd; }
+                if (IsKeyDown(KEY_S)) { introPos.x -= fwd.x*spd; introPos.z -= fwd.z*spd; }
+                if (IsKeyDown(KEY_D)) { introPos.x += rgt.x*spd; introPos.z += rgt.z*spd; }
+                if (IsKeyDown(KEY_A)) { introPos.x -= rgt.x*spd; introPos.z -= rgt.z*spd; }
+                introPos.y = 1.6f;  // locked to eye height
+                if (introPos.x >  7.4f) introPos.x =  7.4f; if (introPos.x < -7.4f) introPos.x = -7.4f;
+                if (introPos.z >  35.5f) introPos.z =  35.5f; if (introPos.z < -1.0f) introPos.z = -1.0f;
+            } else {
+                // ---- EDITOR god-mode: free-fly, no bounds, vertical move ----
+                // Hold RIGHT mouse to look (keeps LEFT click free for selecting).
+                // Only lock the cursor on the frame RMB is pressed, free it on
+                // release — calling Disable/Enable every frame re-centers it
+                // (that's the "stuck in the middle" jitter).
+                if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) DisableCursor();
+                if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) EnableCursor();
+                if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+                    Vector2 md = GetMouseDelta();
+                    introYaw += md.x * 0.003f;
+                    introPitch -= md.y * 0.003f;
+                    if (introPitch >  1.5f) introPitch = 1.5f;
+                    if (introPitch < -1.5f) introPitch = -1.5f;
+                }
+                // fly faster with Shift
+                float spd = (IsKeyDown(KEY_LEFT_SHIFT) ? 16.0f : 7.0f) * dt;
+                Vector3 fdir = { cosf(introPitch)*cosf(introYaw), sinf(introPitch), cosf(introPitch)*sinf(introYaw) };
+                Vector3 rgt  = { -sinf(introYaw), 0, cosf(introYaw) };
+                if (IsKeyDown(KEY_W)) { introPos.x += fdir.x*spd; introPos.y += fdir.y*spd; introPos.z += fdir.z*spd; }
+                if (IsKeyDown(KEY_S)) { introPos.x -= fdir.x*spd; introPos.y -= fdir.y*spd; introPos.z -= fdir.z*spd; }
+                if (IsKeyDown(KEY_D)) { introPos.x += rgt.x*spd; introPos.z += rgt.z*spd; }
+                if (IsKeyDown(KEY_A)) { introPos.x -= rgt.x*spd; introPos.z -= rgt.z*spd; }
+                if (IsKeyDown(KEY_SPACE))      introPos.y += spd;   // up
+                if (IsKeyDown(KEY_LEFT_CONTROL)) introPos.y -= spd; // down
+                // no bounds in god-mode (fly anywhere)
+            }
+
+            // In edit mode the door trigger is OFF so you can build freely.
+            bool atDoor = (!editMode && introPos.z < -0.2f && fabsf(introPos.x) < 1.2f);
+            if (atDoor) { EnableCursor(); flashStart = GetTime(); screen = SCREEN_FLASH; }
+
+            Vector3 idir = { cosf(introPitch)*cosf(introYaw), sinf(introPitch), cosf(introPitch)*sinf(introYaw) };
+            Camera3D icam = { 0 };
+            icam.position = introPos;
+            icam.target = (Vector3){ introPos.x+idir.x, introPos.y+idir.y, introPos.z+idir.z };
+            icam.up = (Vector3){0,1,0}; icam.fovy = 75; icam.projection = CAMERA_PERSPECTIVE;
+
+            // ---- LEVEL EDITOR ----
+            // Where the camera ray hits the floor (y=0) — the placement point.
+            Vector3 aim = { introPos.x, 0, introPos.z };
+            if (idir.y < -0.001f) {
+                float dist = -introPos.y / idir.y;       // ray to y=0 plane
+                if (dist > 0 && dist < 80) {
+                    aim = (Vector3){ introPos.x + idir.x*dist, 0, introPos.z + idir.z*dist };
+                    if (gridSnap) { aim.x = roundf(aim.x*2)/2; aim.z = roundf(aim.z*2)/2; }
+                }
+            }
+            if (editMode) {
+                // palette: 1-6 pick prop type, C cycles color, G toggles grid snap
+                if (IsKeyPressed(KEY_ONE))   paletteType = 0;
+                if (IsKeyPressed(KEY_TWO))   paletteType = 1;
+                if (IsKeyPressed(KEY_THREE)) paletteType = 2;
+                if (IsKeyPressed(KEY_FOUR))  paletteType = 3;
+                if (IsKeyPressed(KEY_FIVE))  paletteType = 4;
+                if (IsKeyPressed(KEY_SIX))   paletteType = 5;
+                if (IsKeyPressed(KEY_C))     paletteColor = (paletteColor+1)%8;
+                if (IsKeyPressed(KEY_G))     gridSnap = !gridSnap;
+
+                // LEFT click on empty floor (not right-dragging to look) = place;
+                // but if click hits an existing prop, select it instead.
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+                    // pick: nearest prop along the view ray
+                    float best=9e9f; int bi=-1;
+                    for (int i=0;i<g_propCount;i++){
+                        Vector3 to={g_props[i].pos.x-introPos.x,g_props[i].pos.y-introPos.y,g_props[i].pos.z-introPos.z};
+                        float len=sqrtf(to.x*to.x+to.y*to.y+to.z*to.z); if(len<0.01f)continue;
+                        Vector3 tn={to.x/len,to.y/len,to.z/len};
+                        float dot=tn.x*idir.x+tn.y*idir.y+tn.z*idir.z;
+                        if(dot>0.985f && len<best){best=len;bi=i;}
+                    }
+                    if (bi>=0) propSel=bi;            // clicked a prop -> select
+                    else if (g_propCount<MAX_PROPS) { // empty -> place new
+                        Vector3 sz = DefaultSize((PropType)paletteType);
+                        Prop np; np.type=(PropType)paletteType; np.size=sz; np.rotY=0;
+                        np.color=PROP_PALETTE[paletteColor];
+                        np.texId = texSel;   // assign currently-chosen texture (or -1)
+                        np.pos=(Vector3){aim.x, sz.y/2, aim.z};   // sit on floor
+                        g_props[g_propCount]=np; propSel=g_propCount; g_propCount++;
+                    }
+                }
+                // edit the selected prop
+                if (propSel>=0 && propSel<g_propCount) {
+                    Prop *p=&g_props[propSel];
+                    float ms=5.0f*dt;
+                    if (IsKeyDown(KEY_RIGHT)) p->pos.x+=ms;
+                    if (IsKeyDown(KEY_LEFT))  p->pos.x-=ms;
+                    if (IsKeyDown(KEY_UP))    p->pos.z-=ms;
+                    if (IsKeyDown(KEY_DOWN))  p->pos.z+=ms;
+                    if (IsKeyDown(KEY_PAGE_UP))   p->pos.y+=ms;
+                    if (IsKeyDown(KEY_PAGE_DOWN)) p->pos.y-=ms;
+                    // scale all dims with [ ]
+                    if (IsKeyDown(KEY_RIGHT_BRACKET)){ p->size.x+=ms; p->size.y+=ms; p->size.z+=ms; }
+                    if (IsKeyDown(KEY_LEFT_BRACKET)){ p->size.x-=ms; p->size.y-=ms; p->size.z-=ms;
+                        if(p->size.x<0.1f)p->size.x=0.1f; if(p->size.y<0.1f)p->size.y=0.1f; if(p->size.z<0.1f)p->size.z=0.1f; }
+                    // rotate with , .
+                    if (IsKeyDown(KEY_COMMA))  p->rotY-=60*dt;
+                    if (IsKeyDown(KEY_PERIOD)) p->rotY+=60*dt;
+                    // recolor selected with C
+                    if (IsKeyPressed(KEY_C)) p->color=PROP_PALETTE[paletteColor];
+                    // T cycles texture on the selected prop: -1(none)->0->1->...->none
+                    if (IsKeyPressed(KEY_T)) {
+                        p->texId = (p->texId+1 >= g_texCount) ? -1 : p->texId+1;
+                        texSel = p->texId;
+                    }
+                    // Delete / Duplicate
+                    if (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_X)) {
+                        for(int i=propSel;i<g_propCount-1;i++) g_props[i]=g_props[i+1];
+                        g_propCount--; propSel=-1;
+                    }
+                    if (IsKeyPressed(KEY_TAB) && g_propCount<MAX_PROPS) {  // duplicate
+                        g_props[g_propCount]=*p; g_props[g_propCount].pos.x+=1.0f;
+                        propSel=g_propCount; g_propCount++;
+                    }
+                }
+                // Ctrl+S save map
+                if ((IsKeyDown(KEY_LEFT_CONTROL)||IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_S))
+                    SaveMap();
+            }
+
+            BeginDrawing();
+                // IMPORTANT: ClearBackground clears the depth buffer too. Without
+                // it the 3D depth test accumulates garbage and the scene slowly
+                // corrupts/whites out. Clear first, THEN draw the gradient on top.
+                ClearBackground((Color){236,234,228,255});
+                DrawRectangleGradientV(0,0,W,H, (Color){248,247,244,255}, (Color){224,222,216,255});
+                BeginMode3D(icam);
+                    // ---- MUSEUM gallery: textured if pngs present, else marble ----
+                    if (hasFloor)
+                        DrawTexturedQuad(texFloor,(Vector3){0,0,17},(Vector3){8,0,0},(Vector3){0,0,19}, 8.0f);
+                    else {
+                        DrawPlane((Vector3){0,0,17},(Vector2){16,38},(Color){222,220,214,255});
+                        for (int gz=-1; gz<=36; gz+=2)
+                            DrawLine3D((Vector3){-8,0.01f,(float)gz},(Vector3){8,0.01f,(float)gz},(Color){210,208,202,255});
+                        for (int gx=-8; gx<=8; gx+=2)
+                            DrawLine3D((Vector3){(float)gx,0.01f,-1},(Vector3){(float)gx,0.01f,36},(Color){210,208,202,255});
+                    }
+                    DrawCube((Vector3){0,5,17},16,0.2f,38,(Color){248,246,242,255});         // ceiling
+                    // walls: textured quads if wall.png, else solid cubes
+                    if (hasWall) {
+                        DrawTexturedQuad(texWall,(Vector3){-7.9f,2.5f,17},(Vector3){0,0,19},(Vector3){0,2.5f,0}, 6.0f); // left
+                        DrawTexturedQuad(texWall,(Vector3){7.9f,2.5f,17}, (Vector3){0,0,19},(Vector3){0,2.5f,0}, 6.0f); // right
+                        DrawTexturedQuad(texWall,(Vector3){0,2.5f,36.1f},(Vector3){8,0,0},(Vector3){0,2.5f,0}, 4.0f);  // far
+                    } else {
+                        DrawCube((Vector3){-8,2.5f,17},0.3f,5,38,(Color){244,242,236,255});
+                        DrawCube((Vector3){8,2.5f,17},0.3f,5,38,(Color){244,242,236,255});
+                        DrawCube((Vector3){0,2.5f,36.2f},16,5,0.3f,(Color){240,238,232,255});
+                    }
+                    // entrance wall with door gap (exit to the program)
+                    DrawCube((Vector3){-4,2.5f,-1},8,5,0.3f,(Color){238,236,230,255});
+                    DrawCube((Vector3){4,2.5f,-1},8,5,0.3f,(Color){238,236,230,255});
+                    DrawCube((Vector3){0,4.2f,-1},2.4f,1.4f,0.3f,(Color){238,236,230,255});   // lintel
+                    DrawCube((Vector3){0,1.4f,-1.05f},2.2f,2.8f,0.05f,(Color){40,45,55,255}); // doorway
+
+                    // ---- exhibits: pedestals down both sides with display objects ----
+                    for (int zz = 6; zz <= 30; zz += 8) {
+                        // left pedestal + exhibit
+                        DrawCube((Vector3){-5.5f,0.6f,(float)zz},1.4f,1.2f,1.4f,(Color){210,208,202,255});
+                        DrawCubeWires((Vector3){-5.5f,0.6f,(float)zz},1.4f,1.2f,1.4f,(Color){180,178,172,255});
+                        DrawCube((Vector3){-5.5f,1.6f,(float)zz},0.7f,0.7f,0.7f,(Color){120,150,190,255});
+                        // right pedestal + exhibit
+                        DrawCube((Vector3){5.5f,0.6f,(float)zz},1.4f,1.2f,1.4f,(Color){210,208,202,255});
+                        DrawCubeWires((Vector3){5.5f,0.6f,(float)zz},1.4f,1.2f,1.4f,(Color){180,178,172,255});
+                        DrawSphere((Vector3){5.5f,1.7f,(float)zz},0.5f,(Color){190,150,110,255});
+                        // framed "paintings" on the walls (textured if art pngs present)
+                        DrawCube((Vector3){-7.8f,2.6f,(float)zz},0.1f,1.7f,2.3f,(Color){70,55,40,255}); // L frame
+                        if (hasArt1) DrawTexturedQuad(texArt1,(Vector3){-7.73f,2.6f,(float)zz},(Vector3){0,0,0.95f},(Vector3){0,0.65f,0},1.0f);
+                        else DrawCube((Vector3){-7.74f,2.6f,(float)zz},0.05f,1.3f,1.9f,(Color){170,185,205,255});
+                        DrawCube((Vector3){7.8f,2.6f,(float)zz},0.1f,1.7f,2.3f,(Color){70,55,40,255});  // R frame
+                        if (hasArt2) DrawTexturedQuad(texArt2,(Vector3){7.73f,2.6f,(float)zz},(Vector3){0,0,0.95f},(Vector3){0,0.65f,0},1.0f);
+                        else DrawCube((Vector3){7.74f,2.6f,(float)zz},0.05f,1.3f,1.9f,(Color){200,180,160,255});
+                    }
+
+                    // ---- user-loaded 3D models (.obj/.glb) ----
+                    for (int i=0;i<modelCount;i++)
+                        DrawModel(loadedModels[i], modelPos[i], modelScale[i], WHITE);
+
+                    // ---- placed editor props ----
+                    for (int i=0;i<g_propCount;i++) {
+                        DrawProp(&g_props[i], WHITE, false);
+                        if (editMode && i==propSel) {
+                            float pulse = 0.5f + 0.5f*sinf(t*6.0f);
+                            Vector3 s = g_props[i].size;
+                            float mx = (s.x>s.y?s.x:s.y); mx = (mx>s.z?mx:s.z);
+                            DrawCubeWires(g_props[i].pos, s.x*1.1f, s.y*1.1f, s.z*1.1f,
+                                          (Color){255,150,40,(unsigned char)(150+pulse*100)});
+                            DrawCircle3D((Vector3){g_props[i].pos.x,0.02f,g_props[i].pos.z}, mx*0.7f,
+                                         (Vector3){1,0,0},90.0f,(Color){255,160,40,200});
+                        }
+                    }
+
+                    // ---- editor: grid + placement ghost ----
+                    if (editMode) {
+                        DrawGrid(40, 1.0f);
+                        Vector3 gs = DefaultSize((PropType)paletteType);
+                        Color ghost = PROP_PALETTE[paletteColor]; ghost.a = 120;
+                        DrawCubeWires((Vector3){aim.x, gs.y/2, aim.z}, gs.x,gs.y,gs.z, (Color){60,120,200,255});
+                        DrawCube((Vector3){aim.x, gs.y/2, aim.z}, gs.x,gs.y,gs.z, ghost);
+                    }
+                EndMode3D();
+
+                if (!editMode) {
+                    const char *pr = "Welcome to the museum  -  walk to the exit  (WASD + mouse)   -   E: editor";
+                    Txt(pr, W/2 - TxtW(pr,20)/2, H-60, 20, (Color){70,72,84,255});
+                } else {
+                    // ===== EDITOR UI =====
+                    // top bar
+                    DrawRectangle(0,0,W,28,(Color){26,28,36,235});
+                    Txt("LEVEL EDITOR", 12, 6, 18, (Color){235,238,245,255});
+                    Txt("RMB look | WASD+Spc/Ctrl fly | Click place/select | Arrows move | [ ] scale | , . rotate | T texture | C color | X del | Tab dupe | Ctrl+S save | E exit",
+                        150, 8, 12, (Color){150,155,170,255});
+
+                    // left palette panel
+                    int px=10, pyy=40, pw=150;
+                    DrawRectangle(px-4, pyy-4, pw+8, 8+PROP_TYPE_COUNT*26+70, (Color){26,28,36,230});
+                    Txt("PROPS (1-6)", px+6, pyy, 14, (Color){200,205,215,255});
+                    for (int i=0;i<PROP_TYPE_COUNT;i++) {
+                        Rectangle rb={px,(float)(pyy+22+i*26),pw,22};
+                        bool selp = (paletteType==i);
+                        DrawRectangle((int)rb.x,(int)rb.y,(int)rb.width,(int)rb.height, selp?(Color){70,110,180,255}:(Color){40,42,52,255});
+                        Txt(TextFormat("%d  %s", i+1, PROP_NAMES[i]), px+8, pyy+25+i*26, 14, RAYWHITE);
+                    }
+                    // color swatch
+                    int cy = pyy+22+PROP_TYPE_COUNT*26+8;
+                    Txt("COLOR (C)", px+6, cy, 13, (Color){200,205,215,255});
+                    for (int i=0;i<8;i++)
+                        DrawRectangle(px+(i%8)*17, cy+18, 15, 15, (i==paletteColor)?(Color){255,255,255,255}:PROP_PALETTE[i]);
+                    for (int i=0;i<8;i++)
+                        DrawRectangle(px+(i%8)*17+1, cy+19, 13, 13, PROP_PALETTE[i]);
+                    DrawText(gridSnap?"Grid: ON (G)":"Grid: OFF (G)", px+6, cy+40, 12, gridSnap?(Color){140,200,150,255}:(Color){200,150,150,255});
+
+                    // ---- TEXTURE panel (right side): imported images ----
+                    int tx=W-180, ty=40, tw2=170;
+                    DrawRectangle(tx-4,ty-4,tw2+8, 8+24+(g_texCount>0?g_texCount:1)*40, (Color){26,28,36,230});
+                    Txt(TextFormat("TEXTURES (%d)  T:apply", g_texCount), tx+6, ty, 13, (Color){200,205,215,255});
+                    if (g_texCount==0)
+                        DrawText("drop .png in /textures", tx+6, ty+26, 11, (Color){170,170,180,255});
+                    for (int i=0;i<g_texCount;i++) {
+                        int ry=ty+24+i*40;
+                        bool selt = (propSel>=0 && g_props[propSel].texId==i);
+                        if (selt) DrawRectangle(tx-2,ry-2,tw2+4,38,(Color){70,110,180,255});
+                        DrawTexturePro(g_texLib[i], (Rectangle){0,0,(float)g_texLib[i].width,(float)g_texLib[i].height},
+                                       (Rectangle){(float)tx,(float)ry,34,34}, (Vector2){0,0}, 0, WHITE);
+                        Txt(g_texName[i], tx+40, ry+8, 12, RAYWHITE);
+                    }
+
+                    // bottom status
+                    if (propSel>=0 && propSel<g_propCount) {
+                        Prop*p=&g_props[propSel];
+                        Txt(TextFormat("Selected: %s   pos %.1f,%.1f,%.1f   size %.1f,%.1f,%.1f   rot %.0f   (%d props)",
+                            PROP_NAMES[p->type], p->pos.x,p->pos.y,p->pos.z, p->size.x,p->size.y,p->size.z, p->rotY, g_propCount),
+                            12, H-26, 15, (Color){255,170,60,255});
+                    } else {
+                        Txt(TextFormat("Click floor to place a %s   (%d props placed)", PROP_NAMES[paletteType], g_propCount),
+                            12, H-26, 15, (Color){150,155,170,255});
+                    }
+                }
+            EndDrawing();
+        }
+        else if (screen == SCREEN_FLASH)
+        {
+            // ---- "Program starting..." flash, ~1.6s, then to login ----
+            double el = GetTime() - flashStart;
+            if (el > 1.6) { screen = SCREEN_USERNAME; }
+            // fade: white flash in, then text
+            BeginDrawing();
+                ClearBackground(BLACK);
+                float a = (el < 0.25) ? (el/0.25f) : 1.0f;      // quick fade-in
+                const char *t1 = "PROGRAM STARTING";
+                Txt(t1, W/2 - TxtW(t1,36)/2, H/2-30, 36, (Color){230,230,240,(unsigned char)(a*255)});
+                // dots
+                int dots = ((int)(el*3)) % 4;
+                char d[8] = ""; for (int i=0;i<dots;i++) d[i]='.'; d[dots]='\0';
+                Txt(d, W/2 - TxtW("...",36)/2, H/2+20, 36, (Color){150,160,200,(unsigned char)(a*255)});
+            EndDrawing();
+        }
+        else if (screen == SCREEN_USERNAME)
         {
             // Tab / click switches which field has focus.
             if (IsKeyPressed(KEY_TAB)) loginField ^= 1;
@@ -608,7 +1235,13 @@ int main(void)
             int c = GetCharPressed();
             while (c > 0) {
                 size_t len = strlen(target);
-                if (c >= 32 && c < 127 && len < cap - 1) { target[len] = (char)c; target[len+1] = '\0'; }
+                // Username (field 0) is restricted to [A-Za-z0-9_-] so it is safe
+                // to embed in URLs/commands and matches the server's validation.
+                // Password (field 1) allows any printable ASCII.
+                bool ok = (loginField == 0)
+                    ? ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_'||c=='-')
+                    : (c >= 32 && c < 127);
+                if (ok && len < cap - 1) { target[len] = (char)c; target[len+1] = '\0'; }
                 c = GetCharPressed();
             }
             if (IsKeyPressed(KEY_BACKSPACE)) {
@@ -651,8 +1284,8 @@ int main(void)
                 Txt(title, W/2 - TxtW(title, ts)/2, (int)(H*0.5f - 110), ts, (Color){210,213,222,255});
 
                 // username box
-                DrawRectangleRounded(uBox, 0.18f, 6, (Color){26,27,33,255});
-                DrawRectangleRoundedLines(uBox, 0.18f, 6,
+                DrawRectangleRounded(uBox, 0.05f, 4, (Color){26,27,33,255});
+                DrawRectangleRoundedLines(uBox, 0.05f, 4,
                     loginField==0 ? (Color){110,115,130,255} : (Color){56,58,68,255});
                 char ub[40]; snprintf(ub, sizeof(ub), "%s%s", g_username,
                     (loginField==0 && ((int)(GetTime()*2))%2) ? "_" : "");
@@ -660,8 +1293,8 @@ int main(void)
                     g_username[0]?(Color){220,222,230,255}:(Color){95,98,110,255});
 
                 // password box (masked)
-                DrawRectangleRounded(pBox, 0.18f, 6, (Color){26,27,33,255});
-                DrawRectangleRoundedLines(pBox, 0.18f, 6,
+                DrawRectangleRounded(pBox, 0.05f, 4, (Color){26,27,33,255});
+                DrawRectangleRoundedLines(pBox, 0.05f, 4,
                     loginField==1 ? (Color){110,115,130,255} : (Color){56,58,68,255});
                 char stars[64]; size_t pl = strlen(loginPw);
                 for (size_t i=0;i<pl && i<sizeof(stars)-2;i++) stars[i]='*';
@@ -670,10 +1303,10 @@ int main(void)
                 Txt(loginPw[0]?stars:"password", (int)pBox.x+14, (int)pBox.y+9, 19,
                     loginPw[0]?(Color){220,222,230,255}:(Color){95,98,110,255});
 
-                // submit button (flat, muted)
-                Color gbg = !canGo ? (Color){34,35,42,255} : (Color){48,72,110,255};
-                DrawRectangleRounded(go, 0.18f, 6, gbg);
-                DrawRectangleRoundedLines(go, 0.18f, 6, (Color){70,90,125,160});
+                // submit button (flat, sharp, accent blue)
+                Color gbg = !canGo ? (Color){34,35,42,255} : ACC_BLUE;
+                DrawRectangleRounded(go, 0.04f, 4, gbg);
+                DrawRectangleRoundedLines(go, 0.04f, 4, (Color){70,90,125,160});
                 const char *gt = authBusy ? "Please wait..." : (registerMode ? "Create account" : "Sign in");
                 Txt(gt, (int)(go.x + go.width/2 - TxtW(gt,17)/2), (int)(go.y+11), 17,
                     canGo ? (Color){225,228,236,255} : (Color){120,123,133,255});
@@ -847,7 +1480,7 @@ int main(void)
                     Rectangle resB = { sp.x+18, sp.y+220, sp.width-36, 34 };
                     if (Button(resB, TextFormat("Resolution: %s", resLabel[resMode]), 14,
                                (Color){30,32,40,255}, (Color){42,45,55,255}, (Color){170,185,215,255}, m)) {
-                        resMode = (resMode + 1) % 5;
+                        resMode = (resMode + 1) % resCount;
                         // If fullscreen, drop to windowed so the new size is visible.
                         if (IsWindowFullscreen()) ToggleFullscreen();
                         int mm = GetCurrentMonitor();
@@ -1002,8 +1635,8 @@ int main(void)
                     char *fl = strtok(fbuf, "\n");
                     while (fl) {
                         if (fl[0]) {
-                            // green if that friend is currently online
-                            int online = (strstr(g_online, fl) != NULL);
+                            // green if that friend is currently online (exact match)
+                            int online = NameOnline(fl);
                             Txt(fl, px+18, fy, 15, online ? (Color){40,140,70,255} : (Color){130,130,140,255});
                             if (online) Txt("online", px+pw-58, fy, 12, (Color){40,140,70,255});
                             fy += 22; fsh++;
@@ -1176,6 +1809,10 @@ int main(void)
             float dt = GetFrameTime();
             int spectator = (g_myRole == 2);
 
+            // Refresh match state (scores/round/winner) ~2x/sec. Without this the
+            // scoreboard and the win banner never update during a match.
+            if (GetTime() >= nextGamePoll) { GamePoll(); nextGamePoll = GetTime() + 0.5; }
+
             // Match info from the lobby server (scores/round/winner).
             char p0[32], p1[32], win[32];
             GsStr("p0", p0, sizeof(p0)); GsStr("p1", p1, sizeof(p1)); GsStr("winner", win, sizeof(win));
@@ -1281,7 +1918,8 @@ int main(void)
             static double scoreLock = 0;
             if (haveOpp && opp.hp <= 0 && fpHP > 0 && GetTime() > scoreLock && !win[0]) {
                 char cmd[512], out[64];
-                snprintf(cmd,sizeof(cmd),"curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/score?name=%s\"", g_serverURL, g_username);
+                char un[128]; UrlEncode(g_username, un, sizeof(un));
+                snprintf(cmd,sizeof(cmd),"curl -s -m 4 -H \"ngrok-skip-browser-warning: 1\" \"%s/score?name=%s\"", g_serverURL, un);
                 RunCapture(cmd,out,sizeof(out));
                 scoreLock = GetTime() + 3.0;     // avoid double-report
                 fpHP = 100;                      // reset my health for next round
@@ -1389,6 +2027,13 @@ int main(void)
         }
     }
 
+    for (int i=0;i<modelCount;i++) UnloadModel(loadedModels[i]);
+    for (int i=0;i<g_texCount;i++) UnloadTexture(g_texLib[i]);
+    if (hasFloor) UnloadTexture(texFloor);
+    if (hasWall)  UnloadTexture(texWall);
+    if (hasCeil)  UnloadTexture(texCeil);
+    if (hasArt1)  UnloadTexture(texArt1);
+    if (hasArt2)  UnloadTexture(texArt2);
     voice_shutdown();
     game_shutdown();
     if (g_fontOK) UnloadFont(g_font);
